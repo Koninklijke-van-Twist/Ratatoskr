@@ -759,6 +759,10 @@ if (ratatoskr_action_is('sync_received_orders')) {
             background: #fbfdff;
         }
 
+        .stats-card-full {
+            grid-column: 1 / -1;
+        }
+
         .stats-card h3 {
             margin: 0 0 10px;
             font-size: 16px;
@@ -957,7 +961,7 @@ if (ratatoskr_action_is('sync_received_orders')) {
             </div>
             <div class="modal-body">
                 <div class="stats-grid">
-                    <div class="stats-card">
+                    <div class="stats-card stats-card-full">
                         <h3>Gemiddelde doorlooptijd</h3>
                         <div id="vendorStatsArea"></div>
                     </div>
@@ -1354,7 +1358,11 @@ if (ratatoskr_action_is('sync_received_orders')) {
 
                     return {
                         label: periodLabel(monthsBack),
-                        count: periodOrders.length,
+                        totalOrders: periodOrders.length,
+                        receivedOrders: periodOrders.filter(function (order)
+                        {
+                            return parseDateOnly(order.receipt_date) !== null;
+                        }).length,
                         orderToShip: orderToShip,
                         shipToReceipt: shipToReceipt,
                         totalLead: totalLead,
@@ -1376,7 +1384,7 @@ if (ratatoskr_action_is('sync_received_orders')) {
                     return;
                 }
 
-                let html = '<table class="stats-table"><thead><tr><th>Periode</th><th>Bestelling → versturen</th><th>Versturen → ontvangen</th><th>Totaal</th><th>Orders</th></tr></thead><tbody>';
+                let html = '<table class="stats-table"><thead><tr><th>Periode</th><th>Bestelling → versturen</th><th>Versturen → ontvangen</th><th>Totaal</th><th>Totaal orders</th><th>Waarvan reeds ontvangen</th></tr></thead><tbody>';
                 for (const row of rows)
                 {
                     html += '<tr>'
@@ -1384,7 +1392,8 @@ if (ratatoskr_action_is('sync_received_orders')) {
                         + '<td>' + escapeHtml(formatDurationDays(row.orderToShip)) + '</td>'
                         + '<td>' + escapeHtml(formatDurationDays(row.shipToReceipt)) + '</td>'
                         + '<td>' + escapeHtml(formatDurationDays(row.totalLead)) + '</td>'
-                        + '<td>' + escapeHtml(String(row.count || 0)) + '</td>'
+                    + '<td>' + escapeHtml(String(row.totalOrders || 0)) + '</td>'
+                    + '<td>' + escapeHtml(String(row.receivedOrders || 0)) + '</td>'
                         + '</tr>';
                 }
                 html += '</tbody></table>';
