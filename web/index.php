@@ -394,6 +394,23 @@ if (ratatoskr_action_is('sync_received_orders')) {
             color: var(--muted);
         }
 
+        .toggle-field {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            font-size: 14px;
+            font-weight: 700;
+            color: var(--brand-dark);
+            user-select: none;
+        }
+
+        .toggle-field input {
+            width: 18px;
+            height: 18px;
+            accent-color: var(--brand-dark);
+            margin: 0;
+        }
+
         select,
         button {
             width: 100%;
@@ -537,6 +554,12 @@ if (ratatoskr_action_is('sync_received_orders')) {
             background: #f8fbff;
             border: 1px solid #e2edf7;
             min-width: 0;
+        }
+
+        .date-box-warning {
+            border-color: #f3b300;
+            background: #fff9e8;
+            box-shadow: inset 0 0 0 1px rgba(243, 179, 0, 0.2);
         }
 
         .date-label {
@@ -915,6 +938,13 @@ if (ratatoskr_action_is('sync_received_orders')) {
                     </div>
                 </div>
 
+                <div class="field" style="margin-top:10px;">
+                    <label class="toggle-field" for="receivedOnlyToggle">
+                        <input type="checkbox" id="receivedOnlyToggle" autocomplete="off">
+                        Alleen reeds ontvangen orders tonen
+                    </label>
+                </div>
+
                 <div class="status-bar" aria-live="polite">
                     <p id="statusText" class="status-text">Kies een bedrijf om de orderlijst te laden.</p>
                     <button id="clearOrdersButton" class="btn-ghost btn-inline" type="button" disabled>Wis
@@ -976,6 +1006,7 @@ if (ratatoskr_action_is('sync_received_orders')) {
             const companySelect = document.getElementById('companySelect');
             const loadOrdersButton = document.getElementById('loadOrdersButton');
             const clearOrdersButton = document.getElementById('clearOrdersButton');
+            const receivedOnlyToggle = document.getElementById('receivedOnlyToggle');
             const statusText = document.getElementById('statusText');
             const orderList = document.getElementById('orderList');
             const summaryBadge = document.getElementById('summaryBadge');
@@ -993,6 +1024,8 @@ if (ratatoskr_action_is('sync_received_orders')) {
 
             const state = {
                 orders: [],
+                allOrders: [],
+                receivedOnly: false,
                 loading: false,
             };
 
@@ -1211,9 +1244,23 @@ if (ratatoskr_action_is('sync_received_orders')) {
                 });
             }
 
-            function renderOrders (orders)
+            function visibleOrdersFromState ()
             {
-                state.orders = sortOrders(orders);
+                const sourceOrders = Array.isArray(state.allOrders) ? state.allOrders : [];
+                if (!state.receivedOnly)
+                {
+                    return sourceOrders;
+                }
+
+                return sourceOrders.filter(function (order)
+                {
+                    return String(order.receipt_date || '').trim() !== '';
+                });
+            }
+
+            function renderOrders ()
+            {
+                state.orders = sortOrders(visibleOrdersFromState());
                 clearOrdersButton.disabled = state.loading || state.orders.length === 0;
                 setSummary(state.orders);
 
@@ -1231,11 +1278,13 @@ if (ratatoskr_action_is('sync_received_orders')) {
                     const orderDateText = formatDate(order.order_date);
                     const shipmentText = order.shipment_date ? formatDate(order.shipment_date) : 'Nog niet verstuurd';
                     const receiptText = order.receipt_date ? formatDate(order.receipt_date) : 'Nog niet ontvangen';
-                    const shipmentNote = order.shipment_date ? '' : 'Geen verzendingsdatum in BC.';
+                    const isReceivedWithoutShipment = !order.shipment_date && !!order.receipt_date;
+                    const shipmentNote = order.shipment_date ? '' : (isReceivedWithoutShipment ? 'Order is al ontvangen, maar heeft geen verzendingsdatum.' : 'Geen verzendingsdatum in BC.');
                     const receiptNote = order.receipt_date ? '' : 'Geen ontvangstdatum in BC.';
                     const orderNote = order.received ? 'Order staat als ontvangen gemarkeerd.' : 'Order staat nog open of deels open.';
                     const errorHtml = order.load_error ? '<div class="order-error">' + escapeHtml(order.load_error) + '</div>' : '';
                     const vendorButton = '<button type="button" class="vendor-button" data-vendor-no="' + vendorNo + '" data-vendor-name="' + vendorName + '">' + vendorName + '</button>';
+                    const shipmentClass = isReceivedWithoutShipment ? 'date-box date-box-warning' : 'date-box';
 
                     return '<li class="order-card" style="animation-delay:' + Math.min(index * 18, 220) + 'ms">'
                         + '<div class="order-top">'
@@ -1247,12 +1296,23 @@ if (ratatoskr_action_is('sync_received_orders')) {
                         + '</div>'
                         + '<div class="date-grid">'
                         + '<div class="date-box"><span class="date-label">Besteldatum</span><span class="date-value">' + escapeHtml(orderDateText) + '</span></div>'
-                        + '<div class="date-box"><span class="date-label">Verzending</span><span class="date-value">' + escapeHtml(shipmentText) + '</span><span class="date-note">' + escapeHtml(shipmentNote) + '</span></div>'
+                        + '<div class="' + shipmentClass + '"><span class="date-label">Verzending</span><span class="date-value">' + escapeHtml(shipmentText) + '</span><span class="date-note">' + escapeHtml(shipmentNote) + '</span></div>'
                         + '<div class="date-box"><span class="date-label">Ontvangst</span><span class="date-value">' + escapeHtml(receiptText) + '</span><span class="date-note">' + escapeHtml(receiptNote) + '</span></div>'
                         + '</div>'
                         + errorHtml
                         + '</li>';
                 }).join('');
+            }
+
+            function applyLiveFilters ()
+            {
+                state.receivedOnly = !!(receivedOnlyToggle && receivedOnlyToggle.checked);
+                renderOrders();
+
+                if (state.allOrders.length > 0)
+                {
+                    setStatus(state.orders.length + ' zichtbare orders' + (state.receivedOnly ? ' (alleen ontvangen).' : '.'), false);
+                }
             }
 
             function periodLabel (monthsBack)
@@ -1443,7 +1503,8 @@ if (ratatoskr_action_is('sync_received_orders')) {
                     });
                     if (summaries.length === 0)
                     {
-                        renderOrders([]);
+                        state.allOrders = [];
+                        renderOrders();
                         setStatus('Geen inkooporders gevonden voor ' + company + '.', false);
                         return;
                     }
@@ -1505,7 +1566,8 @@ if (ratatoskr_action_is('sync_received_orders')) {
                     }
 
                     const detailedOrders = sortOrders(Array.from(ordersByNo.values()));
-                    renderOrders(detailedOrders);
+                    state.allOrders = detailedOrders;
+                    renderOrders();
                     setStatus(detailedOrders.length + ' orders geladen voor ' + company + '.', false);
                     setLoaderSteps(['SQLite geladen', 'Orderdetails geladen', 'Lijst getoond'], 2, 100);
                     updateLoaderProgress(detailedOrders.length, detailedOrders.length, 'Klaar.');
@@ -1550,7 +1612,8 @@ if (ratatoskr_action_is('sync_received_orders')) {
                 } catch (error)
                 {
                     setStatus((error && error.message) ? error.message : 'Laden mislukt.', true);
-                    renderOrders([]);
+                    state.allOrders = [];
+                    renderOrders();
                 } finally
                 {
                     hideLoader();
@@ -1560,6 +1623,7 @@ if (ratatoskr_action_is('sync_received_orders')) {
             function clearOrders ()
             {
                 state.orders = [];
+                state.allOrders = [];
                 orderList.innerHTML = '<div class="empty-state">Nog geen orders geladen.</div>';
                 setSummary([]);
                 clearOrdersButton.disabled = true;
@@ -1582,6 +1646,11 @@ if (ratatoskr_action_is('sync_received_orders')) {
             {
                 void loadOrders();
             });
+
+            if (receivedOnlyToggle)
+            {
+                receivedOnlyToggle.addEventListener('change', applyLiveFilters);
+            }
 
             clearOrdersButton.addEventListener('click', clearOrders);
 
