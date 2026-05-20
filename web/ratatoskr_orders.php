@@ -204,7 +204,8 @@ function ratatoskr_open_order_lower_bound(string $company): string
 {
     $latestNotReceivedOrderDate = ratatoskr_normalize_date_only(ratatoskr_store_get_latest_not_received_order_date($company));
     if ($latestNotReceivedOrderDate === '') {
-        return '';
+        // Geen SQLite-state (bijv. verse server): gebruik de vaste 2-jaars cutoff als veilige ondergrens.
+        return ratatoskr_two_year_cutoff_date();
     }
 
     $roundedLowerBound = ratatoskr_round_open_order_lower_bound($latestNotReceivedOrderDate);
@@ -356,7 +357,12 @@ function ratatoskr_fetch_recent_received_candidates(string $company, string $sin
 {
     $sinceDate = trim($sinceDate);
     if ($sinceDate === '') {
-        $sinceDate = '1900-01-01';
+        // Geen SQLite-state (bijv. verse server): kijk maximaal 2 jaar terug.
+        // '1900-01-01' zou alle bonnen ooit ophalen en de pagina laten bevriezen.
+        $sinceDate = ratatoskr_two_year_cutoff_date();
+        if ($sinceDate === '') {
+            $sinceDate = ratatoskr_date_years_ago(2);
+        }
     }
 
     $environment = auth_get_environment_for_company($company, $ttl);
