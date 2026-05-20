@@ -49,14 +49,44 @@ function ratatoskr_order_list_payload(string $company): array
 function ratatoskr_order_detail_payload(string $company): array
 {
     $orderNo = trim((string) ($_POST['order_no'] ?? $_GET['order_no'] ?? ''));
+    $orderDate = trim((string) ($_POST['order_date'] ?? $_GET['order_date'] ?? ''));
     if ($orderNo === '') {
         throw new RuntimeException('Ordernummer ontbreekt.');
     }
 
     $receivedFlag = ratatoskr_bool_from_request($_POST['received'] ?? $_GET['received'] ?? false);
-    $order = ratatoskr_fetch_order_detail($company, $orderNo, $receivedFlag);
+    $order = ratatoskr_fetch_order_detail($company, $orderNo, $receivedFlag, $orderDate, false);
     if (!is_array($order)) {
         throw new RuntimeException('Order niet gevonden.');
+    }
+
+    return [
+        'ok' => true,
+        'company' => $company,
+        'order' => $order,
+    ];
+}
+
+function ratatoskr_recheck_order_payload(string $company): array
+{
+    $orderNo = trim((string) ($_POST['order_no'] ?? $_GET['order_no'] ?? ''));
+    $orderDate = trim((string) ($_POST['order_date'] ?? $_GET['order_date'] ?? ''));
+    if ($orderNo === '') {
+        throw new RuntimeException('Ordernummer ontbreekt.');
+    }
+
+    $order = ratatoskr_fetch_order_detail($company, $orderNo, false, $orderDate, true);
+    if (!is_array($order)) {
+        throw new RuntimeException('Order niet gevonden.');
+    }
+
+    $receiptDate = trim((string) ($order['receipt_date'] ?? ''));
+    if ($receiptDate !== '') {
+        ratatoskr_store_save_received_orders($company, [$order], $receiptDate);
+    }
+
+    if (trim((string) ($order['source'] ?? '')) !== 'permanent') {
+        ratatoskr_store_remove_permanent_order($company, $orderNo);
     }
 
     return [
@@ -201,6 +231,19 @@ if (ratatoskr_action_is('order_detail')) {
         ratatoskr_send_json(ratatoskr_order_detail_payload($company));
     } catch (Throwable $error) {
         ratatoskr_runtime_error_payload($error, 'Inkooporder ophalen mislukt.');
+    }
+}
+
+if (ratatoskr_action_is('recheck_order')) {
+    $company = trim((string) ($_POST['company'] ?? ''));
+    if ($company === '' || !in_array($company, $companies, true)) {
+        ratatoskr_send_json(['ok' => false, 'error' => 'Kies een geldig bedrijf.'], 400);
+    }
+
+    try {
+        ratatoskr_send_json(ratatoskr_recheck_order_payload($company));
+    } catch (Throwable $error) {
+        ratatoskr_runtime_error_payload($error, 'Opnieuw controleren van inkooporder mislukt.');
     }
 }
 
@@ -411,6 +454,7 @@ if (ratatoskr_action_is('sync_received_orders')) {
             margin: 0;
         }
 
+        input,
         select,
         button {
             width: 100%;
@@ -537,8 +581,32 @@ if (ratatoskr_action_is('sync_received_orders')) {
             text-align: left;
         }
 
+        .order-actions {
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+            justify-content: flex-end;
+        }
+
         .vendor-button:hover {
             background: rgba(0, 153, 204, 0.18);
+        }
+
+        .recheck-button {
+            border: 1px solid rgba(0, 82, 155, 0.25);
+            background: #ffffff;
+            color: var(--brand-dark);
+            padding: 8px 10px;
+            border-radius: 999px;
+            font-weight: 700;
+            min-height: 34px;
+            width: auto;
+            cursor: pointer;
+        }
+
+        .recheck-button:hover {
+            border-color: rgba(0, 82, 155, 0.5);
+            background: #f3f9ff;
         }
 
         .date-grid {
@@ -560,6 +628,17 @@ if (ratatoskr_action_is('sync_received_orders')) {
             border-color: #f3b300;
             background: #fff9e8;
             box-shadow: inset 0 0 0 1px rgba(243, 179, 0, 0.2);
+        }
+
+        .date-box-danger {
+            border-color: rgba(197, 48, 48, 0.45);
+            background: #fff1f1;
+            box-shadow: inset 0 0 0 1px rgba(197, 48, 48, 0.2);
+        }
+
+        .date-box-danger .date-value {
+            color: var(--danger);
+            font-weight: 800;
         }
 
         .date-label {
@@ -607,27 +686,28 @@ if (ratatoskr_action_is('sync_received_orders')) {
 
         .loader-overlay {
             position: fixed;
-            inset: 0;
+            top: 14px;
+            right: 14px;
             z-index: 11000;
             display: none;
-            align-items: center;
-            justify-content: center;
-            padding: 16px;
-            background: rgba(12, 24, 38, 0.56);
-            backdrop-filter: blur(3px);
+            width: min(380px, calc(100vw - 28px));
+            pointer-events: none;
         }
 
         .loader-overlay.is-visible {
-            display: flex;
+            display: block;
         }
 
         .loader-card {
-            width: min(100%, 520px);
+            width: 100%;
+            pointer-events: auto;
             border-radius: 22px;
             padding: 18px;
             background: linear-gradient(180deg, rgba(255, 255, 255, 0.98), rgba(245, 250, 255, 0.98));
             border: 1px solid rgba(183, 203, 228, 0.9);
-            box-shadow: 0 24px 50px rgba(10, 18, 29, 0.3);
+            box-shadow: 0 24px 50px rgba(10, 18, 29, 0.24);
+            max-height: calc(100vh - 28px);
+            overflow: auto;
         }
 
         .loader-title {
@@ -880,8 +960,29 @@ if (ratatoskr_action_is('sync_received_orders')) {
                 width: 100%;
             }
 
+            .order-actions {
+                width: 100%;
+                justify-content: stretch;
+            }
+
+            .recheck-button {
+                width: 100%;
+            }
+
             .modal-overlay {
                 padding: 0;
+            }
+
+            .loader-overlay {
+                top: auto;
+                right: 10px;
+                left: 10px;
+                bottom: 10px;
+                width: auto;
+            }
+
+            .loader-card {
+                max-height: min(56vh, 460px);
             }
 
             .modal-card {
@@ -945,10 +1046,13 @@ if (ratatoskr_action_is('sync_received_orders')) {
                     </label>
                 </div>
 
+                <div class="field" style="margin-top:10px;">
+                    <label for="orderSearchInput">Zoeken in orders</label>
+                    <input id="orderSearchInput" type="search" placeholder="Zoek op ordernummer, datum of leverancier" autocomplete="off" spellcheck="false">
+                </div>
+
                 <div class="status-bar" aria-live="polite">
                     <p id="statusText" class="status-text">Kies een bedrijf om de orderlijst te laden.</p>
-                    <button id="clearOrdersButton" class="btn-ghost btn-inline" type="button" disabled>Wis
-                        lijst</button>
                 </div>
             </section>
 
@@ -1005,8 +1109,8 @@ if (ratatoskr_action_is('sync_received_orders')) {
         {
             const companySelect = document.getElementById('companySelect');
             const loadOrdersButton = document.getElementById('loadOrdersButton');
-            const clearOrdersButton = document.getElementById('clearOrdersButton');
             const receivedOnlyToggle = document.getElementById('receivedOnlyToggle');
+            const orderSearchInput = document.getElementById('orderSearchInput');
             const statusText = document.getElementById('statusText');
             const orderList = document.getElementById('orderList');
             const summaryBadge = document.getElementById('summaryBadge');
@@ -1026,7 +1130,9 @@ if (ratatoskr_action_is('sync_received_orders')) {
                 orders: [],
                 allOrders: [],
                 receivedOnly: false,
+                searchQuery: '',
                 loading: false,
+                renderedOrderNos: new Set(),
             };
 
             function escapeHtml (value)
@@ -1127,7 +1233,6 @@ if (ratatoskr_action_is('sync_received_orders')) {
                 state.loading = Boolean(isLoading);
                 loadOrdersButton.disabled = state.loading;
                 companySelect.disabled = state.loading;
-                clearOrdersButton.disabled = state.loading || state.orders.length === 0;
                 loaderOverlay.classList.toggle('is-visible', state.loading);
             }
 
@@ -1226,6 +1331,9 @@ if (ratatoskr_action_is('sync_received_orders')) {
                 merged.status = firstNonEmpty(detailData.status, detailData.Status, summaryData.status, summaryData.Status);
                 merged.vendor_order_no = firstNonEmpty(detailData.vendor_order_no, detailData.Vendor_Order_No, summaryData.vendor_order_no, summaryData.Vendor_Order_No);
                 merged.load_error = String(detailData.load_error || summaryData.load_error || '').trim();
+                merged.debug_cache_miss = Boolean(detailData.debug_cache_miss || summaryData.debug_cache_miss);
+                merged.permanent_unknown_shipment = Boolean(detailData.permanent_unknown_shipment || summaryData.permanent_unknown_shipment);
+                merged.permanent_unknown_receipt = Boolean(detailData.permanent_unknown_receipt || summaryData.permanent_unknown_receipt);
                 return merged;
             }
 
@@ -1247,21 +1355,185 @@ if (ratatoskr_action_is('sync_received_orders')) {
             function visibleOrdersFromState ()
             {
                 const sourceOrders = Array.isArray(state.allOrders) ? state.allOrders : [];
-                if (!state.receivedOnly)
-                {
-                    return sourceOrders;
-                }
-
                 return sourceOrders.filter(function (order)
                 {
-                    return String(order.receipt_date || '').trim() !== '';
+                    if (state.receivedOnly && String(order.receipt_date || '').trim() === '')
+                    {
+                        return false;
+                    }
+
+                    const query = String(state.searchQuery || '').trim().toLowerCase();
+                    if (query === '')
+                    {
+                        return true;
+                    }
+
+                    const orderDateRaw = String(order.order_date || '').trim();
+                    const orderDateFormatted = formatDate(orderDateRaw).toLowerCase();
+                    const haystack = [
+                        String(order.order_no || '').trim(),
+                        orderDateRaw,
+                        orderDateFormatted,
+                        String(order.vendor_name || '').trim(),
+                        String(order.vendor_no || '').trim(),
+                    ].join(' ').toLowerCase();
+
+                    return haystack.indexOf(query) !== -1;
                 });
+            }
+
+            function orderKey (value)
+            {
+                return String(value || '').trim().toLowerCase();
+            }
+
+            function orderRenderSignature (order)
+            {
+                return [
+                    String(order.order_no || '').trim(),
+                    String(order.order_date || '').trim(),
+                    String(order.vendor_no || '').trim(),
+                    String(order.vendor_name || '').trim(),
+                    String(order.shipment_date || '').trim(),
+                    String(order.receipt_date || '').trim(),
+                    String(order.status || '').trim(),
+                    String(order.vendor_order_no || '').trim(),
+                    String(order.source || '').trim(),
+                    String(order.load_error || '').trim(),
+                    String(Boolean(order.debug_cache_miss)),
+                    String(Boolean(order.permanent_unknown_shipment)),
+                    String(Boolean(order.permanent_unknown_receipt)),
+                ].join('|');
+            }
+
+            function buildOrderCardHtml (order, index)
+            {
+                const orderNoRaw = String(order.order_no || '').trim();
+                const orderNo = escapeHtml(orderNoRaw);
+                const debugCacheMiss = Boolean(order.debug_cache_miss);
+                const debugMarker = debugCacheMiss ? '<span class="debug-cache-miss" title="Niet uit OData cache geladen" aria-label="Niet uit OData cache geladen">&bull;</span>' : '';
+                const vendorName = escapeHtml(order.vendor_name || 'Onbekende leverancier');
+                const vendorNo = escapeHtml(order.vendor_no || '');
+                const orderDateText = formatDate(order.order_date);
+                const permanentUnknownShipment = Boolean(order.permanent_unknown_shipment);
+                const permanentUnknownReceipt = Boolean(order.permanent_unknown_receipt);
+                const shipmentText = order.shipment_date ? formatDate(order.shipment_date) : (permanentUnknownShipment ? 'Nooit verzonden' : 'Nog niet verstuurd');
+                const receiptText = order.receipt_date ? formatDate(order.receipt_date) : (permanentUnknownReceipt ? 'Nooit ontvangen' : 'Nog niet ontvangen');
+                const isReceivedWithoutShipment = !order.shipment_date && !!order.receipt_date;
+                const shipmentNote = order.shipment_date ? '' : (permanentUnknownShipment ? 'Geen verzenddatum in BC.' : (isReceivedWithoutShipment ? 'Order is al ontvangen, maar heeft geen verzendingsdatum.' : 'Geen verzendingsdatum in BC.'));
+                const receiptNote = order.receipt_date ? '' : 'Geen ontvangstdatum in BC.';
+                const orderNote = order.received ? 'Order staat als ontvangen gemarkeerd.' : 'Order staat nog open of deels open.';
+                const errorHtml = order.load_error ? '<div class="order-error">' + escapeHtml(order.load_error) + '</div>' : '';
+                const vendorButton = '<button type="button" class="vendor-button" data-vendor-no="' + vendorNo + '" data-vendor-name="' + vendorName + '">' + vendorName + '</button>';
+                const recheckButton = String(order.source || '').trim() === 'permanent'
+                    ? '<button type="button" class="recheck-button" data-order-no="' + orderNo + '">Opnieuw controleren</button>'
+                    : '';
+                const shipmentClass = isReceivedWithoutShipment ? 'date-box date-box-warning' : 'date-box';
+                const receiptClass = permanentUnknownReceipt ? 'date-box date-box-danger' : 'date-box';
+
+                return '<li class="order-card" data-order-no="' + orderNo + '" style="animation-delay:' + Math.min(index * 18, 220) + 'ms">'
+                    + '<div class="order-top">'
+                    + '<div>'
+                    + '<h3 class="order-number">' + orderNo + debugMarker + '</h3>'
+                    + '<p class="order-meta">' + escapeHtml(orderNote) + '</p>'
+                    + '</div>'
+                    + '<div class="order-actions">' + vendorButton + recheckButton + '</div>'
+                    + '</div>'
+                    + '<div class="date-grid">'
+                    + '<div class="date-box"><span class="date-label">Besteldatum</span><span class="date-value">' + escapeHtml(orderDateText) + '</span></div>'
+                    + '<div class="' + shipmentClass + '"><span class="date-label">Verzending</span><span class="date-value">' + escapeHtml(shipmentText) + '</span><span class="date-note">' + escapeHtml(shipmentNote) + '</span></div>'
+                    + '<div class="' + receiptClass + '"><span class="date-label">Ontvangst</span><span class="date-value">' + escapeHtml(receiptText) + '</span><span class="date-note">' + escapeHtml(receiptNote) + '</span></div>'
+                    + '</div>'
+                    + errorHtml
+                    + '</li>';
+            }
+
+            function createOrderCardElement (order, index)
+            {
+                const template = document.createElement('template');
+                template.innerHTML = buildOrderCardHtml(order, index);
+                const card = template.content.firstElementChild;
+                if (!card)
+                {
+                    return null;
+                }
+
+                card.dataset.orderKey = orderKey(order.order_no);
+                card.dataset.renderSignature = orderRenderSignature(order);
+                return card;
+            }
+
+            function animateOrderCardGrowth (card, key)
+            {
+                if (!card || !key || state.renderedOrderNos.has(key))
+                {
+                    return;
+                }
+
+                state.renderedOrderNos.add(key);
+                const targetHeight = card.scrollHeight;
+                card.style.overflow = 'hidden';
+                card.style.height = '0px';
+                card.style.opacity = '0';
+
+                requestAnimationFrame(function ()
+                {
+                    card.style.transition = 'height 600ms ease, opacity 260ms ease';
+                    card.style.height = targetHeight + 'px';
+                    card.style.opacity = '1';
+                });
+
+                const cleanup = function ()
+                {
+                    card.style.height = '';
+                    card.style.overflow = '';
+                    card.style.transition = '';
+                    card.style.opacity = '';
+                    card.removeEventListener('transitionend', cleanup);
+                };
+
+                card.addEventListener('transitionend', cleanup);
+            }
+
+            function animateOrderCardMove (card, fromTop, toTop)
+            {
+                if (!card)
+                {
+                    return;
+                }
+
+                const deltaY = fromTop - toTop;
+                if (!Number.isFinite(deltaY) || Math.abs(deltaY) < 1)
+                {
+                    return;
+                }
+
+                card.style.transition = 'none';
+                card.style.transform = 'translateY(' + deltaY + 'px)';
+                requestAnimationFrame(function ()
+                {
+                    card.style.transition = 'transform 260ms ease';
+                    card.style.transform = 'translateY(0)';
+                });
+
+                const cleanup = function (event)
+                {
+                    if (event.propertyName !== 'transform')
+                    {
+                        return;
+                    }
+
+                    card.style.transition = '';
+                    card.style.transform = '';
+                    card.removeEventListener('transitionend', cleanup);
+                };
+
+                card.addEventListener('transitionend', cleanup);
             }
 
             function renderOrders ()
             {
                 state.orders = sortOrders(visibleOrdersFromState());
-                clearOrdersButton.disabled = state.loading || state.orders.length === 0;
                 setSummary(state.orders);
 
                 if (state.orders.length === 0)
@@ -1270,48 +1542,118 @@ if (ratatoskr_action_is('sync_received_orders')) {
                     return;
                 }
 
-                orderList.innerHTML = state.orders.map(function (order, index)
+                const emptyState = orderList.querySelector('.empty-state');
+                if (emptyState)
                 {
-                    const orderNo = escapeHtml(order.order_no || '');
-                    const vendorName = escapeHtml(order.vendor_name || 'Onbekende leverancier');
-                    const vendorNo = escapeHtml(order.vendor_no || '');
-                    const orderDateText = formatDate(order.order_date);
-                    const shipmentText = order.shipment_date ? formatDate(order.shipment_date) : 'Nog niet verstuurd';
-                    const receiptText = order.receipt_date ? formatDate(order.receipt_date) : 'Nog niet ontvangen';
-                    const isReceivedWithoutShipment = !order.shipment_date && !!order.receipt_date;
-                    const shipmentNote = order.shipment_date ? '' : (isReceivedWithoutShipment ? 'Order is al ontvangen, maar heeft geen verzendingsdatum.' : 'Geen verzendingsdatum in BC.');
-                    const receiptNote = order.receipt_date ? '' : 'Geen ontvangstdatum in BC.';
-                    const orderNote = order.received ? 'Order staat als ontvangen gemarkeerd.' : 'Order staat nog open of deels open.';
-                    const errorHtml = order.load_error ? '<div class="order-error">' + escapeHtml(order.load_error) + '</div>' : '';
-                    const vendorButton = '<button type="button" class="vendor-button" data-vendor-no="' + vendorNo + '" data-vendor-name="' + vendorName + '">' + vendorName + '</button>';
-                    const shipmentClass = isReceivedWithoutShipment ? 'date-box date-box-warning' : 'date-box';
+                    emptyState.remove();
+                }
 
-                    return '<li class="order-card" style="animation-delay:' + Math.min(index * 18, 220) + 'ms">'
-                        + '<div class="order-top">'
-                        + '<div>'
-                        + '<h3 class="order-number">' + orderNo + '</h3>'
-                        + '<p class="order-meta">' + escapeHtml(orderNote) + '</p>'
-                        + '</div>'
-                        + '<div>' + vendorButton + '</div>'
-                        + '</div>'
-                        + '<div class="date-grid">'
-                        + '<div class="date-box"><span class="date-label">Besteldatum</span><span class="date-value">' + escapeHtml(orderDateText) + '</span></div>'
-                        + '<div class="' + shipmentClass + '"><span class="date-label">Verzending</span><span class="date-value">' + escapeHtml(shipmentText) + '</span><span class="date-note">' + escapeHtml(shipmentNote) + '</span></div>'
-                        + '<div class="date-box"><span class="date-label">Ontvangst</span><span class="date-value">' + escapeHtml(receiptText) + '</span><span class="date-note">' + escapeHtml(receiptNote) + '</span></div>'
-                        + '</div>'
-                        + errorHtml
-                        + '</li>';
-                }).join('');
+                const existingCards = Array.from(orderList.querySelectorAll('.order-card[data-order-key]'));
+                const existingByKey = new Map(existingCards.map(function (card)
+                {
+                    return [String(card.dataset.orderKey || ''), card];
+                }));
+                const beforePositions = new Map(existingCards.map(function (card)
+                {
+                    return [String(card.dataset.orderKey || ''), card.getBoundingClientRect().top];
+                }));
+                const desiredKeys = new Set();
+                let insertionCursor = orderList.firstElementChild;
+
+                state.orders.forEach(function (order, index)
+                {
+                    const key = orderKey(order.order_no);
+                    if (key === '')
+                    {
+                        return;
+                    }
+
+                    desiredKeys.add(key);
+                    let card = existingByKey.get(key) || null;
+                    const expectedSignature = orderRenderSignature(order);
+                    const isNewCard = !card;
+
+                    if (!card)
+                    {
+                        card = createOrderCardElement(order, index);
+                        if (!card)
+                        {
+                            return;
+                        }
+                    }
+                    else if (String(card.dataset.renderSignature || '') !== expectedSignature)
+                    {
+                        const replacement = createOrderCardElement(order, index);
+                        if (!replacement)
+                        {
+                            return;
+                        }
+
+                        orderList.replaceChild(replacement, card);
+                        card = replacement;
+                    }
+                    else
+                    {
+                        card.style.animationDelay = Math.min(index * 18, 220) + 'ms';
+                    }
+
+                    if (card !== insertionCursor)
+                    {
+                        orderList.insertBefore(card, insertionCursor);
+                    }
+
+                    insertionCursor = card.nextElementSibling;
+                    if (isNewCard)
+                    {
+                        animateOrderCardGrowth(card, key);
+                    }
+                });
+
+                existingByKey.forEach(function (card, key)
+                {
+                    if (!desiredKeys.has(key) && card.parentNode === orderList)
+                    {
+                        card.remove();
+                    }
+                });
+
+                desiredKeys.forEach(function (key)
+                {
+                    const card = orderList.querySelector('.order-card[data-order-key="' + key.replace(/"/g, '\\"') + '"]');
+                    if (!card)
+                    {
+                        return;
+                    }
+
+                    const fromTop = beforePositions.get(key);
+                    const toTop = card.getBoundingClientRect().top;
+                    if (!state.renderedOrderNos.has(key) && Number.isFinite(fromTop))
+                    {
+                        animateOrderCardMove(card, fromTop, toTop);
+                    }
+                });
             }
 
             function applyLiveFilters ()
             {
                 state.receivedOnly = !!(receivedOnlyToggle && receivedOnlyToggle.checked);
+                state.searchQuery = String((orderSearchInput && orderSearchInput.value) || '').trim();
                 renderOrders();
 
                 if (state.allOrders.length > 0)
                 {
-                    setStatus(state.orders.length + ' zichtbare orders' + (state.receivedOnly ? ' (alleen ontvangen).' : '.'), false);
+                    const parts = [];
+                    if (state.receivedOnly)
+                    {
+                        parts.push('alleen ontvangen');
+                    }
+                    if (state.searchQuery !== '')
+                    {
+                        parts.push('zoekterm: "' + state.searchQuery + '"');
+                    }
+
+                    const suffix = parts.length > 0 ? ' (' + parts.join(', ') + ').' : '.';
+                    setStatus(state.orders.length + ' zichtbare orders' + suffix, false);
                 }
             }
 
@@ -1452,8 +1794,8 @@ if (ratatoskr_action_is('sync_received_orders')) {
                         + '<td>' + escapeHtml(formatDurationDays(row.orderToShip)) + '</td>'
                         + '<td>' + escapeHtml(formatDurationDays(row.shipToReceipt)) + '</td>'
                         + '<td>' + escapeHtml(formatDurationDays(row.totalLead)) + '</td>'
-                    + '<td>' + escapeHtml(String(row.totalOrders || 0)) + '</td>'
-                    + '<td>' + escapeHtml(String(row.receivedOrders || 0)) + '</td>'
+                        + '<td>' + escapeHtml(String(row.totalOrders || 0)) + '</td>'
+                        + '<td>' + escapeHtml(String(row.receivedOrders || 0)) + '</td>'
                         + '</tr>';
                 }
                 html += '</tbody></table>';
@@ -1475,6 +1817,64 @@ if (ratatoskr_action_is('sync_received_orders')) {
                 vendorModal.classList.remove('is-visible');
             }
 
+            async function recheckOrder (orderNo)
+            {
+                const normalizedOrderNo = String(orderNo || '').trim();
+                if (normalizedOrderNo === '')
+                {
+                    return;
+                }
+
+                const company = String(companySelect.value || '').trim();
+                if (company === '')
+                {
+                    setStatus('Kies eerst een bedrijf.', true);
+                    return;
+                }
+
+                const existing = (Array.isArray(state.allOrders) ? state.allOrders : []).find(function (order)
+                {
+                    return String(order.order_no || '').trim().toLowerCase() === normalizedOrderNo.toLowerCase();
+                }) || null;
+
+                try
+                {
+                    setStatus('Order ' + normalizedOrderNo + ' wordt opnieuw gecontroleerd...', false);
+                    const payload = await postJson('index.php?action=recheck_order', {
+                        company: company,
+                        order_no: normalizedOrderNo,
+                        order_date: String((existing && existing.order_date) || '').trim(),
+                    });
+
+                    const updated = normalizeOrder(existing || {}, (payload && payload.order) ? payload.order : {});
+                    const nextOrders = (Array.isArray(state.allOrders) ? state.allOrders.slice() : []).map(function (order)
+                    {
+                        if (String(order.order_no || '').trim().toLowerCase() !== normalizedOrderNo.toLowerCase())
+                        {
+                            return order;
+                        }
+                        return updated;
+                    });
+
+                    const existsAfterMap = nextOrders.some(function (order)
+                    {
+                        return String(order.order_no || '').trim().toLowerCase() === normalizedOrderNo.toLowerCase();
+                    });
+                    if (!existsAfterMap)
+                    {
+                        nextOrders.push(updated);
+                    }
+
+                    state.allOrders = sortOrders(nextOrders);
+                    renderOrders();
+                    setStatus('Order ' + normalizedOrderNo + ' is opnieuw gecontroleerd en bijgewerkt.', false);
+                }
+                catch (error)
+                {
+                    setStatus((error && error.message) ? error.message : ('Opnieuw controleren van order ' + normalizedOrderNo + ' mislukt.'), true);
+                }
+            }
+
             async function loadOrders ()
             {
                 const company = String(companySelect.value || '').trim();
@@ -1487,6 +1887,7 @@ if (ratatoskr_action_is('sync_received_orders')) {
                 try
                 {
                     setLoading(true);
+                    state.renderedOrderNos = new Set();
                     showLoader('Inkooporders laden', 'Lijst met orderkoppen ophalen voor ' + company + '.');
                     setLoaderSteps(['Orderkoppen ophalen', 'Orderdetails laden', 'Lijst tonen'], 0, 0);
                     updateLoaderProgress(0, 1, 'Orderkoppen ophalen...');
@@ -1509,7 +1910,6 @@ if (ratatoskr_action_is('sync_received_orders')) {
                         return;
                     }
 
-                    const ordersByNo = new Map();
                     const upsertOrder = function (order)
                     {
                         const normalizedOrder = normalizeOrder(order, order);
@@ -1519,17 +1919,31 @@ if (ratatoskr_action_is('sync_received_orders')) {
                             return;
                         }
 
-                        const existingOrder = ordersByNo.get(orderNo) || {};
-                        ordersByNo.set(orderNo, Object.assign({}, existingOrder, normalizedOrder));
+                        const existingIndex = state.allOrders.findIndex(function (item)
+                        {
+                            return String(item.order_no || '').trim().toLowerCase() === orderNo.toLowerCase();
+                        });
+
+                        if (existingIndex === -1)
+                        {
+                            state.allOrders.push(normalizedOrder);
+                        }
+                        else
+                        {
+                            state.allOrders[existingIndex] = Object.assign({}, state.allOrders[existingIndex], normalizedOrder);
+                        }
+
+                        state.allOrders = sortOrders(state.allOrders);
+                        renderOrders();
                     };
 
+                    state.allOrders = [];
                     storedSummaries.forEach(function (order)
                     {
                         upsertOrder(order);
                     });
 
                     const totalOrders = Math.max(1, summaries.length);
-                    const storedPercent = Math.min(100, Math.round((storedSummaries.length / totalOrders) * 100));
                     setLoaderSteps(['Historische orders laden', 'Orderdetails laden', 'Lijst tonen'], 1, 0);
                     updateLoaderProgress(storedSummaries.length, totalOrders, storedSummaries.length + ' historische orders geladen.');
 
@@ -1550,6 +1964,7 @@ if (ratatoskr_action_is('sync_received_orders')) {
                             const detailPayload = await postJson('index.php?action=order_detail', {
                                 company: company,
                                 order_no: orderNo,
+                                order_date: String(summary.order_date || '').trim(),
                                 received: summary.received ? '1' : '0',
                             });
 
@@ -1565,7 +1980,7 @@ if (ratatoskr_action_is('sync_received_orders')) {
                         }
                     }
 
-                    const detailedOrders = sortOrders(Array.from(ordersByNo.values()));
+                    const detailedOrders = sortOrders(state.allOrders.slice());
                     state.allOrders = detailedOrders;
                     renderOrders();
                     setStatus(detailedOrders.length + ' orders geladen voor ' + company + '.', false);
@@ -1624,9 +2039,9 @@ if (ratatoskr_action_is('sync_received_orders')) {
             {
                 state.orders = [];
                 state.allOrders = [];
+                state.renderedOrderNos = new Set();
                 orderList.innerHTML = '<div class="empty-state">Nog geen orders geladen.</div>';
                 setSummary([]);
-                clearOrdersButton.disabled = true;
                 setStatus('De lijst is gewist. Kies opnieuw een bedrijf en laad de orders.', false);
             }
 
@@ -1652,10 +2067,21 @@ if (ratatoskr_action_is('sync_received_orders')) {
                 receivedOnlyToggle.addEventListener('change', applyLiveFilters);
             }
 
-            clearOrdersButton.addEventListener('click', clearOrders);
+            if (orderSearchInput)
+            {
+                orderSearchInput.addEventListener('input', applyLiveFilters);
+            }
 
             orderList.addEventListener('click', function (event)
             {
+                const recheckButton = event.target.closest('.recheck-button');
+                if (recheckButton)
+                {
+                    const orderNo = String(recheckButton.getAttribute('data-order-no') || '').trim();
+                    void recheckOrder(orderNo);
+                    return;
+                }
+
                 const button = event.target.closest('.vendor-button');
                 if (!button)
                 {

@@ -8,6 +8,11 @@ require_once __DIR__ . '/ratatoskr_order_store.php';
 const RATATOSKR_ORDER_LIST_TTL = 18000;
 const RATATOSKR_ORDER_TTL_NOT_RECEIVED = 18000;
 const RATATOSKR_ORDER_TTL_RECEIVED = 315360000;
+const RATATOSKR_ORDER_TTL_OLDER_THAN_WEEK = 259200;
+const RATATOSKR_ORDER_TTL_OLDER_THAN_MONTH = 604800;
+const RATATOSKR_ORDER_TTL_OLDER_THAN_THREE_MONTHS = 1209600;
+const RATATOSKR_ORDER_TTL_OLDER_THAN_HALF_YEAR = 2592000;
+const RATATOSKR_ORDER_TTL_OLDER_THAN_ONE_YEAR = 7776000;
 
 /**
  * Functies
@@ -78,6 +83,177 @@ function ratatoskr_pick_date(array $row, array $fields): string
     return '';
 }
 
+function ratatoskr_normalize_date_only(string $value): string
+{
+    $text = trim($value);
+    if ($text === '') {
+        return '';
+    }
+
+    $parts = preg_split('/[T\s]/', $text, 2);
+    $dateOnly = trim((string) ($parts[0] ?? ''));
+    if (!preg_match('/^\d{4}-\d{2}-\d{2}$/', $dateOnly)) {
+        return '';
+    }
+
+    return $dateOnly;
+}
+
+function ratatoskr_days_since_date(string $dateOnly): ?int
+{
+    $normalized = ratatoskr_normalize_date_only($dateOnly);
+    if ($normalized === '') {
+        return null;
+    }
+
+    $timestamp = strtotime($normalized . ' 00:00:00 UTC');
+    if ($timestamp === false) {
+        return null;
+    }
+
+    $ageSeconds = time() - $timestamp;
+    if ($ageSeconds < 0) {
+        return 0;
+    }
+
+    return (int) floor($ageSeconds / 86400);
+}
+
+function ratatoskr_date_years_ago(int $years): string
+{
+    try {
+        $now = new DateTimeImmutable('now', new DateTimeZone('UTC'));
+        return $now->sub(new DateInterval('P' . max(0, $years) . 'Y'))->format('Y-m-d');
+    } catch (Throwable $ignoredError) {
+        return gmdate('Y-m-d');
+    }
+}
+
+function ratatoskr_floor_to_monday(DateTimeImmutable $date): DateTimeImmutable
+{
+    return $date->modify('monday this week')->setTime(0, 0, 0);
+}
+
+function ratatoskr_floor_to_month_step(DateTimeImmutable $date, int $months): DateTimeImmutable
+{
+    $safeMonths = max(1, $months);
+    $year = (int) $date->format('Y');
+    $month = (int) $date->format('n');
+    $stepIndex = (int) floor(($month - 1) / $safeMonths);
+    $startMonth = ($stepIndex * $safeMonths) + 1;
+
+    return $date->setDate($year, $startMonth, 1)->setTime(0, 0, 0);
+}
+
+function ratatoskr_round_open_order_lower_bound(string $dateOnly): string
+{
+    $normalized = ratatoskr_normalize_date_only($dateOnly);
+    if ($normalized === '') {
+        return '';
+    }
+
+    try {
+        $date = new DateTimeImmutable($normalized, new DateTimeZone('UTC'));
+    } catch (Throwable $ignoredError) {
+        return $normalized;
+    }
+
+    $ageDays = ratatoskr_days_since_date($normalized);
+    if (!is_int($ageDays)) {
+        return $normalized;
+    }
+
+    if ($ageDays > 365) {
+        return ratatoskr_floor_to_month_step($date, 12)->format('Y-m-d');
+    }
+    if ($ageDays > 182) {
+        return ratatoskr_floor_to_month_step($date, 6)->format('Y-m-d');
+    }
+    if ($ageDays > 90) {
+        return ratatoskr_floor_to_month_step($date, 3)->format('Y-m-d');
+    }
+    if ($ageDays > 30) {
+        return ratatoskr_floor_to_month_step($date, 1)->format('Y-m-d');
+    }
+    if ($ageDays > 7) {
+        return ratatoskr_floor_to_monday($date)->format('Y-m-d');
+    }
+
+    return $normalized;
+}
+
+function ratatoskr_two_year_cutoff_date(): string
+{
+    $twoYearsAgo = ratatoskr_date_years_ago(2);
+    $normalized = ratatoskr_normalize_date_only($twoYearsAgo);
+    if ($normalized === '') {
+        return '';
+    }
+
+    try {
+        $date = new DateTimeImmutable($normalized, new DateTimeZone('UTC'));
+    } catch (Throwable $ignoredError) {
+        return $normalized;
+    }
+
+    // Stabiliseer de cutoff op maandgrenzen zodat de OData filter-key niet dagelijks verschuift.
+    return ratatoskr_floor_to_month_step($date, 1)->format('Y-m-d');
+}
+
+function ratatoskr_open_order_lower_bound(string $company): string
+{
+    $latestNotReceivedOrderDate = ratatoskr_normalize_date_only(ratatoskr_store_get_latest_not_received_order_date($company));
+    if ($latestNotReceivedOrderDate === '') {
+        return '';
+    }
+
+    $roundedLowerBound = ratatoskr_round_open_order_lower_bound($latestNotReceivedOrderDate);
+    $twoYearCutoff = ratatoskr_two_year_cutoff_date();
+
+    if ($twoYearCutoff === '') {
+        return $roundedLowerBound;
+    }
+
+    return strcmp($roundedLowerBound, $twoYearCutoff) >= 0 ? $roundedLowerBound : $twoYearCutoff;
+}
+
+function ratatoskr_build_open_orders_filter(string $lowerBoundOrderDate): string
+{
+    $clauses = ['LVS_Completely_Received eq false'];
+    $lower = ratatoskr_normalize_date_only($lowerBoundOrderDate);
+
+    if ($lower !== '') {
+        $clauses[] = 'LVS_Order_Date ge ' . $lower;
+    }
+
+    return implode(' and ', $clauses);
+}
+
+function ratatoskr_ttl_for_open_order_age(?int $ageDays): int
+{
+    if (!is_int($ageDays)) {
+        return RATATOSKR_ORDER_TTL_NOT_RECEIVED;
+    }
+
+    if ($ageDays > 365) {
+        return RATATOSKR_ORDER_TTL_OLDER_THAN_ONE_YEAR;
+    }
+    if ($ageDays > 182) {
+        return RATATOSKR_ORDER_TTL_OLDER_THAN_HALF_YEAR;
+    }
+    if ($ageDays > 90) {
+        return RATATOSKR_ORDER_TTL_OLDER_THAN_THREE_MONTHS;
+    }
+    if ($ageDays > 30) {
+        return RATATOSKR_ORDER_TTL_OLDER_THAN_MONTH;
+    }
+    if ($ageDays > 7) {
+        return RATATOSKR_ORDER_TTL_OLDER_THAN_WEEK;
+    }
+
+    return RATATOSKR_ORDER_TTL_NOT_RECEIVED;
+}
+
 function ratatoskr_odata_get_all_uncached(string $url, array $auth): array
 {
     $all = [];
@@ -96,13 +272,53 @@ function ratatoskr_odata_get_all_uncached(string $url, array $auth): array
     return $all;
 }
 
+function ratatoskr_odata_is_valid_cache_entry(string $url, array $auth, int $ttlSeconds): bool
+{
+    $safeTtl = max(1, $ttlSeconds);
+    $cacheKey = build_cache_key($url, $auth);
+    $cachePath = cache_path_for_key($cacheKey);
+
+    if (!is_file($cachePath)) {
+        return false;
+    }
+
+    $cached = read_cache_payload($cachePath, $safeTtl);
+    return (bool) ($cached['valid'] ?? false);
+}
+
+function ratatoskr_odata_get_all_with_cache_flag(string $url, array $auth, int $ttlSeconds): array
+{
+    $safeTtl = max(1, $ttlSeconds);
+    $cacheKey = build_cache_key($url, $auth);
+    $cachePath = cache_path_for_key($cacheKey);
+
+    if (is_file($cachePath)) {
+        $cached = read_cache_payload($cachePath, $safeTtl);
+        if ((bool) ($cached['valid'] ?? false)) {
+            return [
+                'rows' => is_array($cached['data'] ?? null) ? $cached['data'] : [],
+                'from_cache' => true,
+            ];
+        }
+    }
+
+    $rows = odata_get_all($url, $auth, $safeTtl);
+
+    return [
+        'rows' => $rows,
+        'from_cache' => false,
+    ];
+}
+
 function ratatoskr_fetch_open_order_candidates(string $company, int $ttl = RATATOSKR_ORDER_LIST_TTL): array
 {
     $environment = auth_get_environment_for_company($company, $ttl);
     $auth = auth_get_auth_for_environment($environment);
+    $openOrderLowerBound = ratatoskr_open_order_lower_bound($company);
+    $openOrderFilter = ratatoskr_build_open_orders_filter($openOrderLowerBound);
     $url = ratatoskr_company_entity_url_with_query($company, 'PurchaseOrders', [
         '$select' => 'No,LVS_Order_Date,Document_Date,Posting_Date,Buy_from_Vendor_No,Buy_from_Vendor_Name,LVS_Ex_Factory_Date,LVS_Date_on_Board,LVS_Expected_Receipt_Date,LVS_Completely_Received,Status,Vendor_Order_No',
-        '$filter' => 'LVS_Completely_Received eq false',
+        '$filter' => $openOrderFilter,
         '$orderby' => 'LVS_Order_Date desc,No desc',
     ], $environment);
 
@@ -193,6 +409,7 @@ function ratatoskr_order_queue_payload(string $company): array
 {
     $storedOrders = ratatoskr_store_load_received_orders($company);
     $latestReceiptDate = ratatoskr_store_get_latest_received_date($company);
+    $latestNotReceivedOrderDate = ratatoskr_store_get_latest_not_received_order_date($company);
     $recentReceivedOrders = ratatoskr_fetch_recent_received_candidates($company, $latestReceiptDate, RATATOSKR_ORDER_LIST_TTL);
     $openOrders = ratatoskr_fetch_open_order_candidates($company, RATATOSKR_ORDER_LIST_TTL);
 
@@ -221,6 +438,7 @@ function ratatoskr_order_queue_payload(string $company): array
         'ok' => true,
         'company' => $company,
         'latest_received_date' => $latestReceiptDate,
+        'latest_not_received_order_date' => $latestNotReceivedOrderDate,
         'orders' => $orderedOrders,
         'stored_order_count' => count($storedOrders),
         'open_order_count' => count($openOrders),
@@ -261,7 +479,7 @@ function ratatoskr_fetch_order_list(string $company, int $ttl = RATATOSKR_ORDER_
     return $orders;
 }
 
-function ratatoskr_fetch_order_detail(string $company, string $orderNo, bool $receivedFlag, int $ttl = RATATOSKR_ORDER_LIST_TTL): array
+function ratatoskr_fetch_order_detail(string $company, string $orderNo, bool $receivedFlag, string $summaryOrderDate = '', bool $forceRefresh = false, int $ttl = RATATOSKR_ORDER_LIST_TTL): array
 {
     $orderNoText = trim($orderNo);
     if ($orderNoText === '') {
@@ -270,14 +488,22 @@ function ratatoskr_fetch_order_detail(string $company, string $orderNo, bool $re
 
     $environment = auth_get_environment_for_company($company, $ttl);
     $auth = auth_get_auth_for_environment($environment);
-    $detailTtl = $receivedFlag ? RATATOSKR_ORDER_TTL_RECEIVED : RATATOSKR_ORDER_TTL_NOT_RECEIVED;
-    $useCache = !$receivedFlag;
+    $summaryAgeDays = ratatoskr_days_since_date($summaryOrderDate);
+    $detailTtl = $receivedFlag ? RATATOSKR_ORDER_TTL_RECEIVED : ratatoskr_ttl_for_open_order_age($summaryAgeDays);
+    $useCache = !$receivedFlag && !$forceRefresh;
+    $hadCacheMiss = false;
 
     $orderUrl = ratatoskr_company_entity_url_with_query($company, 'PurchaseOrders', [
         '$select' => 'No,LVS_Order_Date,Buy_from_Vendor_No,Buy_from_Vendor_Name,LVS_Ex_Factory_Date,LVS_Date_on_Board,LVS_Expected_Receipt_Date,LVS_Completely_Received,Status,Document_Date,Posting_Date,Vendor_Order_No',
         '$filter' => "No eq '" . str_replace("'", "''", $orderNoText) . "'",
     ], $environment);
-    $orderRows = $useCache ? odata_get_all($orderUrl, $auth, $detailTtl) : ratatoskr_odata_get_all_uncached($orderUrl, $auth);
+    if ($useCache) {
+        $orderFetch = ratatoskr_odata_get_all_with_cache_flag($orderUrl, $auth, $detailTtl);
+        $orderRows = is_array($orderFetch['rows'] ?? null) ? $orderFetch['rows'] : [];
+        $hadCacheMiss = $hadCacheMiss || !((bool) ($orderFetch['from_cache'] ?? false));
+    } else {
+        $orderRows = ratatoskr_odata_get_all_uncached($orderUrl, $auth);
+    }
     $orderRow = null;
     foreach ($orderRows as $row) {
         if (is_array($row)) {
@@ -297,7 +523,13 @@ function ratatoskr_fetch_order_detail(string $company, string $orderNo, bool $re
             '$filter' => "Order_No eq '" . str_replace("'", "''", $orderNoText) . "'",
             '$orderby' => 'Posting_Date desc',
         ], $environment);
-        $receiptRows = $useCache ? odata_get_all($receiptUrl, $auth, $detailTtl) : ratatoskr_odata_get_all_uncached($receiptUrl, $auth);
+        if ($useCache) {
+            $receiptFetch = ratatoskr_odata_get_all_with_cache_flag($receiptUrl, $auth, $detailTtl);
+            $receiptRows = is_array($receiptFetch['rows'] ?? null) ? $receiptFetch['rows'] : [];
+            $hadCacheMiss = $hadCacheMiss || !((bool) ($receiptFetch['from_cache'] ?? false));
+        } else {
+            $receiptRows = ratatoskr_odata_get_all_uncached($receiptUrl, $auth);
+        }
         foreach ($receiptRows as $receiptRow) {
             if (!is_array($receiptRow)) {
                 continue;
@@ -315,7 +547,13 @@ function ratatoskr_fetch_order_detail(string $company, string $orderNo, bool $re
                 '$filter' => "Order_No eq '" . str_replace("'", "''", $orderNoText) . "'",
                 '$orderby' => 'Document_No desc,Line_No asc',
             ], $environment);
-            $receiptLineRows = $useCache ? odata_get_all($receiptLineUrl, $auth, $detailTtl) : ratatoskr_odata_get_all_uncached($receiptLineUrl, $auth);
+            if ($useCache) {
+                $receiptLineFetch = ratatoskr_odata_get_all_with_cache_flag($receiptLineUrl, $auth, $detailTtl);
+                $receiptLineRows = is_array($receiptLineFetch['rows'] ?? null) ? $receiptLineFetch['rows'] : [];
+                $hadCacheMiss = $hadCacheMiss || !((bool) ($receiptLineFetch['from_cache'] ?? false));
+            } else {
+                $receiptLineRows = ratatoskr_odata_get_all_uncached($receiptLineUrl, $auth);
+            }
             $documentNo = '';
             foreach ($receiptLineRows as $receiptLineRow) {
                 if (!is_array($receiptLineRow)) {
@@ -333,7 +571,13 @@ function ratatoskr_fetch_order_detail(string $company, string $orderNo, bool $re
                     '$select' => 'No,Posting_Date,Document_Date',
                     '$filter' => "No eq '" . str_replace("'", "''", $documentNo) . "'",
                 ], $environment);
-                $receiptByDocumentRows = $useCache ? odata_get_all($receiptByDocumentUrl, $auth, $detailTtl) : ratatoskr_odata_get_all_uncached($receiptByDocumentUrl, $auth);
+                if ($useCache) {
+                    $receiptByDocumentFetch = ratatoskr_odata_get_all_with_cache_flag($receiptByDocumentUrl, $auth, $detailTtl);
+                    $receiptByDocumentRows = is_array($receiptByDocumentFetch['rows'] ?? null) ? $receiptByDocumentFetch['rows'] : [];
+                    $hadCacheMiss = $hadCacheMiss || !((bool) ($receiptByDocumentFetch['from_cache'] ?? false));
+                } else {
+                    $receiptByDocumentRows = ratatoskr_odata_get_all_uncached($receiptByDocumentUrl, $auth);
+                }
                 foreach ($receiptByDocumentRows as $receiptByDocumentRow) {
                     if (!is_array($receiptByDocumentRow)) {
                         continue;
@@ -366,6 +610,12 @@ function ratatoskr_fetch_order_detail(string $company, string $orderNo, bool $re
         }
     }
 
+    $orderDate = ratatoskr_pick_date($orderRow, ['LVS_Order_Date', 'Document_Date', 'Posting_Date']);
+    $orderAgeDays = ratatoskr_days_since_date($orderDate !== '' ? $orderDate : $summaryOrderDate);
+    if (!$receivedFlag && $receivedDate === '' && is_int($orderAgeDays)) {
+        $detailTtl = ratatoskr_ttl_for_open_order_age($orderAgeDays);
+    }
+
     $shipmentDate = ratatoskr_pick_date($orderRow, [
         'LVS_Date_on_Board',
         'LVS_Ex_Factory_Date',
@@ -373,9 +623,50 @@ function ratatoskr_fetch_order_detail(string $company, string $orderNo, bool $re
         'Expected_Receipt_Date',
     ]);
 
+    if (!$receivedFlag && $receivedDate === '' && is_int($orderAgeDays) && $orderAgeDays > 730) {
+        $referenceDate = ratatoskr_normalize_date_only($orderDate);
+        if ($referenceDate === '') {
+            $referenceDate = gmdate('Y-m-d');
+        }
+
+        $permanentOrder = [
+            'order_no' => trim((string) ($orderRow['No'] ?? $orderNoText)),
+            'order_date' => $orderDate,
+            'vendor_no' => trim((string) ($orderRow['Buy_from_Vendor_No'] ?? '')),
+            'vendor_name' => trim((string) ($orderRow['Buy_from_Vendor_Name'] ?? '')),
+            'shipment_date' => $shipmentDate,
+            'receipt_date' => $receivedDate,
+            'status' => trim((string) ($orderRow['Status'] ?? '')),
+            'vendor_order_no' => trim((string) ($orderRow['Vendor_Order_No'] ?? '')),
+        ];
+
+        ratatoskr_store_save_permanent_order($company, $permanentOrder, $referenceDate);
+
+        return [
+            'order_no' => $permanentOrder['order_no'],
+            'order_date' => $permanentOrder['order_date'],
+            'vendor_no' => $permanentOrder['vendor_no'],
+            'vendor_name' => $permanentOrder['vendor_name'],
+            'shipment_date' => $permanentOrder['shipment_date'],
+            'receipt_date' => $permanentOrder['receipt_date'],
+            'received' => false,
+            'status' => $permanentOrder['status'],
+            'vendor_order_no' => $permanentOrder['vendor_order_no'],
+            'load_scope' => $detailTtl,
+            'source' => 'permanent',
+            'needs_detail' => false,
+            'permanent_unknown_shipment' => $permanentOrder['shipment_date'] === '',
+            'permanent_unknown_receipt' => $permanentOrder['receipt_date'] === '',
+            'permanent_reference_date' => $referenceDate,
+            'debug_cache_miss' => $hadCacheMiss,
+        ];
+    }
+
+    ratatoskr_store_remove_permanent_order($company, trim((string) ($orderRow['No'] ?? $orderNoText)));
+
     return [
         'order_no' => trim((string) ($orderRow['No'] ?? $orderNoText)),
-        'order_date' => ratatoskr_pick_date($orderRow, ['LVS_Order_Date', 'Document_Date', 'Posting_Date']),
+        'order_date' => $orderDate,
         'vendor_no' => trim((string) ($orderRow['Buy_from_Vendor_No'] ?? '')),
         'vendor_name' => trim((string) ($orderRow['Buy_from_Vendor_Name'] ?? '')),
         'shipment_date' => $shipmentDate,
@@ -384,5 +675,6 @@ function ratatoskr_fetch_order_detail(string $company, string $orderNo, bool $re
         'status' => trim((string) ($orderRow['Status'] ?? '')),
         'vendor_order_no' => trim((string) ($orderRow['Vendor_Order_No'] ?? '')),
         'load_scope' => $detailTtl,
+        'debug_cache_miss' => $hadCacheMiss,
     ];
 }
