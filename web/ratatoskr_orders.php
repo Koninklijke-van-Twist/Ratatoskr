@@ -684,3 +684,490 @@ function ratatoskr_fetch_order_detail(string $company, string $orderNo, bool $re
         'debug_cache_miss' => $hadCacheMiss,
     ];
 }
+
+function ratatoskr_normalize_product_line_row(array $row): ?array
+{
+    $type = trim((string) ($row['Type'] ?? ''));
+    if ($type !== '' && strcasecmp($type, 'Item') !== 0) {
+        return null;
+    }
+
+    $itemNo = trim((string) ($row['No'] ?? $row['Item_No'] ?? ''));
+    $description = trim((string) ($row['Description'] ?? ''));
+    if ($itemNo === '' && $description === '') {
+        return null;
+    }
+
+    return [
+        'item_no' => $itemNo,
+        'description' => $description,
+    ];
+}
+
+function ratatoskr_fetch_receipt_lines_for_orders(string $company, array $orderNos, int $ttl = RATATOSKR_ORDER_LIST_TTL): array
+{
+    $normalizedOrderNos = [];
+    foreach ($orderNos as $orderNo) {
+        $text = trim((string) $orderNo);
+        if ($text === '') {
+            continue;
+        }
+
+        $normalizedOrderNos[strtolower($text)] = $text;
+    }
+
+    if ($normalizedOrderNos === []) {
+        return [];
+    }
+
+    $environment = auth_get_environment_for_company($company, $ttl);
+    $auth = auth_get_auth_for_environment($environment);
+    $linesByOrder = [];
+    $chunks = array_chunk(array_values($normalizedOrderNos), 12);
+
+    foreach ($chunks as $chunk) {
+        $filters = [];
+        foreach ($chunk as $orderNo) {
+            $filters[] = "Order_No eq '" . str_replace("'", "''", $orderNo) . "'";
+        }
+
+        $url = ratatoskr_company_entity_url_with_query($company, 'PostedPurchaseReceiptLines', [
+            '$select' => 'Order_No,No,Description,Type',
+            '$filter' => implode(' or ', $filters),
+        ], $environment);
+
+        try {
+            $rows = ratatoskr_odata_get_all_with_cache_flag($url, $auth, $ttl)['rows'] ?? [];
+        } catch (Throwable $ignoredError) {
+            continue;
+        }
+
+        foreach ($rows as $row) {
+            if (!is_array($row)) {
+                continue;
+            }
+
+            $orderNo = trim((string) ($row['Order_No'] ?? ''));
+            if ($orderNo === '') {
+                continue;
+            }
+
+            $line = ratatoskr_normalize_product_line_row($row);
+            if ($line === null) {
+                continue;
+            }
+
+            $orderKey = strtolower($orderNo);
+            if (!isset($linesByOrder[$orderKey])) {
+                $linesByOrder[$orderKey] = [];
+            }
+
+            $lineKey = strtolower($line['item_no'] . '|' . $line['description']);
+            $linesByOrder[$orderKey][$lineKey] = $line;
+        }
+    }
+
+    $missingOrderNos = [];
+    foreach ($normalizedOrderNos as $orderKey => $orderNo) {
+        if (!isset($linesByOrder[$orderKey]) || $linesByOrder[$orderKey] === []) {
+            $missingOrderNos[] = $orderNo;
+        }
+    }
+
+    if ($missingOrderNos !== []) {
+        $purchaseChunks = array_chunk($missingOrderNos, 12);
+        foreach ($purchaseChunks as $chunk) {
+            $filters = [];
+            foreach ($chunk as $orderNo) {
+                $filters[] = "Document_No eq '" . str_replace("'", "''", $orderNo) . "'";
+            }
+
+            $url = ratatoskr_company_entity_url_with_query($company, 'PurchaseOrderLines', [
+                '$select' => 'Document_No,No,Description,Type',
+                '$filter' => implode(' or ', $filters),
+            ], $environment);
+
+            try {
+                $rows = ratatoskr_odata_get_all_with_cache_flag($url, $auth, $ttl)['rows'] ?? [];
+            } catch (Throwable $ignoredError) {
+                continue;
+            }
+
+            foreach ($rows as $row) {
+                if (!is_array($row)) {
+                    continue;
+                }
+
+                $orderNo = trim((string) ($row['Document_No'] ?? ''));
+                if ($orderNo === '') {
+                    continue;
+                }
+
+                $line = ratatoskr_normalize_product_line_row($row);
+                if ($line === null) {
+                    continue;
+                }
+
+                $orderKey = strtolower($orderNo);
+                if (!isset($linesByOrder[$orderKey])) {
+                    $linesByOrder[$orderKey] = [];
+                }
+
+                $lineKey = strtolower($line['item_no'] . '|' . $line['description']);
+                $linesByOrder[$orderKey][$lineKey] = $line;
+            }
+        }
+    }
+
+    $normalized = [];
+    foreach ($linesByOrder as $orderKey => $lines) {
+        $normalized[$orderKey] = array_values($lines);
+    }
+
+    return $normalized;
+}
+
+function ratatoskr_duration_days_between(?string $fromDate, ?string $toDate): ?float
+{
+    $from = ratatoskr_normalize_date_only(trim((string) $fromDate));
+    $to = ratatoskr_normalize_date_only(trim((string) $toDate));
+    if ($from === '' || $to === '') {
+        return null;
+    }
+
+    $fromTimestamp = strtotime($from . ' 00:00:00 UTC');
+    $toTimestamp = strtotime($to . ' 00:00:00 UTC');
+    if ($fromTimestamp === false || $toTimestamp === false) {
+        return null;
+    }
+
+    $days = ($toTimestamp - $fromTimestamp) / 86400;
+    if ($days < 0) {
+        return null;
+    }
+
+    return $days;
+}
+
+function ratatoskr_average_order_duration(array $orders, callable $predicate, callable $selector): ?float
+{
+    $total = 0.0;
+    $count = 0;
+
+    foreach ($orders as $order) {
+        if (!is_array($order) || !$predicate($order)) {
+            continue;
+        }
+
+        $duration = $selector($order);
+        if (!is_float($duration) && !is_int($duration)) {
+            continue;
+        }
+
+        $duration = (float) $duration;
+        if ($duration < 0) {
+            continue;
+        }
+
+        $total += $duration;
+        $count += 1;
+    }
+
+    return $count === 0 ? null : $total / $count;
+}
+
+function ratatoskr_vendor_product_stats(string $company, array $orders): array
+{
+    $ordersByKey = [];
+    $orderNos = [];
+    $yearStart = gmdate('Y-m-d', strtotime('-1 year UTC'));
+
+    foreach ($orders as $order) {
+        if (!is_array($order)) {
+            continue;
+        }
+
+        $orderNo = trim((string) ($order['order_no'] ?? ''));
+        if ($orderNo === '') {
+            continue;
+        }
+
+        $orderDate = ratatoskr_normalize_date_only(trim((string) ($order['order_date'] ?? '')));
+        if ($orderDate === '' || strcmp($orderDate, $yearStart) < 0) {
+            continue;
+        }
+
+        $orderKey = strtolower($orderNo);
+        $ordersByKey[$orderKey] = [
+            'order_no' => $orderNo,
+            'order_date' => $orderDate,
+            'shipment_date' => ratatoskr_normalize_date_only(trim((string) ($order['shipment_date'] ?? ''))),
+            'receipt_date' => ratatoskr_normalize_date_only(trim((string) ($order['receipt_date'] ?? ''))),
+        ];
+        $orderNos[] = $orderNo;
+    }
+
+    if ($ordersByKey === []) {
+        return [];
+    }
+
+    $linesByOrder = ratatoskr_fetch_receipt_lines_for_orders($company, $orderNos);
+    $products = [];
+
+    foreach ($linesByOrder as $orderKey => $lines) {
+        if (!isset($ordersByKey[$orderKey])) {
+            continue;
+        }
+
+        foreach ($lines as $line) {
+            if (!is_array($line)) {
+                continue;
+            }
+
+            $itemNo = trim((string) ($line['item_no'] ?? ''));
+            $description = trim((string) ($line['description'] ?? ''));
+            $productKey = strtolower($itemNo !== '' ? $itemNo : $description);
+            if ($productKey === '') {
+                continue;
+            }
+
+            if (!isset($products[$productKey])) {
+                $products[$productKey] = [
+                    'item_no' => $itemNo,
+                    'description' => $description,
+                    'order_keys' => [],
+                ];
+            }
+
+            $products[$productKey]['order_keys'][$orderKey] = true;
+        }
+    }
+
+    $stats = [];
+    foreach ($products as $product) {
+        $productOrders = [];
+        foreach (array_keys($product['order_keys']) as $orderKey) {
+            if (isset($ordersByKey[$orderKey])) {
+                $productOrders[] = $ordersByKey[$orderKey];
+            }
+        }
+
+        if ($productOrders === []) {
+            continue;
+        }
+
+        $stats[] = [
+            'item_no' => trim((string) ($product['item_no'] ?? '')),
+            'description' => trim((string) ($product['description'] ?? '')),
+            'orderToShip' => ratatoskr_average_order_duration(
+                $productOrders,
+                static fn(array $order): bool => ($order['order_date'] ?? '') !== '' && ($order['shipment_date'] ?? '') !== '',
+                static fn(array $order): ?float => ratatoskr_duration_days_between($order['order_date'] ?? '', $order['shipment_date'] ?? '')
+            ),
+            'shipToReceipt' => ratatoskr_average_order_duration(
+                $productOrders,
+                static fn(array $order): bool => ($order['shipment_date'] ?? '') !== '' && ($order['receipt_date'] ?? '') !== '',
+                static fn(array $order): ?float => ratatoskr_duration_days_between($order['shipment_date'] ?? '', $order['receipt_date'] ?? '')
+            ),
+            'orderToReceipt' => ratatoskr_average_order_duration(
+                $productOrders,
+                static fn(array $order): bool => ($order['order_date'] ?? '') !== '' && ($order['receipt_date'] ?? '') !== '',
+                static fn(array $order): ?float => ratatoskr_duration_days_between($order['order_date'] ?? '', $order['receipt_date'] ?? '')
+            ),
+            'totalOrders' => count($productOrders),
+            'receivedOrders' => count(array_filter(
+                $productOrders,
+                static fn(array $order): bool => trim((string) ($order['receipt_date'] ?? '')) !== ''
+            )),
+        ];
+    }
+
+    usort($stats, static function (array $left, array $right): int {
+        $leftLabel = trim((string) (($left['description'] ?? '') !== '' ? $left['description'] : ($left['item_no'] ?? '')));
+        $rightLabel = trim((string) (($right['description'] ?? '') !== '' ? $right['description'] : ($right['item_no'] ?? '')));
+
+        return strcasecmp($leftLabel, $rightLabel);
+    });
+
+    return $stats;
+}
+
+function ratatoskr_pick_latest_receipt_date(array $orders): string
+{
+    $latestReceiptDate = '';
+    foreach ($orders as $order) {
+        if (!is_array($order)) {
+            continue;
+        }
+
+        $receiptDate = ratatoskr_normalize_date_only(trim((string) ($order['receipt_date'] ?? '')));
+        if ($receiptDate !== '' && ($latestReceiptDate === '' || strcmp($receiptDate, $latestReceiptDate) > 0)) {
+            $latestReceiptDate = $receiptDate;
+        }
+    }
+
+    return $latestReceiptDate;
+}
+
+function ratatoskr_order_to_received_store_row(array $order): array
+{
+    return [
+        'order_no' => trim((string) ($order['order_no'] ?? '')),
+        'order_date' => trim((string) ($order['order_date'] ?? '')),
+        'vendor_no' => trim((string) ($order['vendor_no'] ?? '')),
+        'vendor_name' => trim((string) ($order['vendor_name'] ?? '')),
+        'shipment_date' => trim((string) ($order['shipment_date'] ?? '')),
+        'receipt_date' => ratatoskr_normalize_date_only(trim((string) ($order['receipt_date'] ?? ''))),
+        'received' => true,
+        'status' => trim((string) ($order['status'] ?? '')),
+        'vendor_order_no' => trim((string) ($order['vendor_order_no'] ?? '')),
+    ];
+}
+
+function ratatoskr_sort_order_summaries_oldest_first(array $orders): array
+{
+    $sorted = array_values($orders);
+    usort($sorted, static function (array $left, array $right): int {
+        $leftDate = ratatoskr_normalize_date_only(trim((string) ($left['order_date'] ?? '')));
+        $rightDate = ratatoskr_normalize_date_only(trim((string) ($right['order_date'] ?? '')));
+        if ($leftDate === '' && $rightDate === '') {
+            return strcasecmp(
+                strtolower(trim((string) ($left['order_no'] ?? ''))),
+                strtolower(trim((string) ($right['order_no'] ?? '')))
+            );
+        }
+        if ($leftDate === '') {
+            return 1;
+        }
+        if ($rightDate === '') {
+            return -1;
+        }
+
+        $dateCompare = strcmp($leftDate, $rightDate);
+        if ($dateCompare !== 0) {
+            return $dateCompare;
+        }
+
+        return strcasecmp(
+            strtolower(trim((string) ($left['order_no'] ?? ''))),
+            strtolower(trim((string) ($right['order_no'] ?? '')))
+        );
+    });
+
+    return $sorted;
+}
+
+function ratatoskr_nightly_order_result(array $order, string $error = ''): array
+{
+    $receiptDate = ratatoskr_normalize_date_only(trim((string) ($order['receipt_date'] ?? '')));
+
+    return [
+        'order_no' => trim((string) ($order['order_no'] ?? '')),
+        'order_date' => ratatoskr_normalize_date_only(trim((string) ($order['order_date'] ?? ''))),
+        'shipment_date' => ratatoskr_normalize_date_only(trim((string) ($order['shipment_date'] ?? ''))),
+        'receipt_date' => $receiptDate,
+        'received' => $receiptDate !== '',
+        'vendor_no' => trim((string) ($order['vendor_no'] ?? '')),
+        'vendor_name' => trim((string) ($order['vendor_name'] ?? '')),
+        'source' => trim((string) ($order['source'] ?? '')),
+        'error' => trim($error),
+    ];
+}
+
+function ratatoskr_sync_company_orders_nightly(string $company, int $batchSize = 10): array
+{
+    $safeBatchSize = max(1, $batchSize);
+    $listPayload = ratatoskr_order_queue_payload($company);
+    $summaries = is_array($listPayload['orders'] ?? null) ? $listPayload['orders'] : [];
+    $detailSummaries = [];
+    $skippedCachedCount = 0;
+
+    foreach ($summaries as $summary) {
+        if (!is_array($summary)) {
+            continue;
+        }
+
+        if (($summary['needs_detail'] ?? true) === false) {
+            $skippedCachedCount += 1;
+            continue;
+        }
+
+        $orderNo = trim((string) ($summary['order_no'] ?? ''));
+        if ($orderNo === '') {
+            continue;
+        }
+
+        $detailSummaries[] = $summary;
+    }
+
+    $detailSummaries = ratatoskr_sort_order_summaries_oldest_first($detailSummaries);
+    $fetchedOrders = [];
+    $errors = [];
+    $syncedReceivedCount = 0;
+
+    foreach (array_chunk($detailSummaries, $safeBatchSize) as $batch) {
+        $batchReceived = [];
+
+        foreach ($batch as $summary) {
+            $orderNo = trim((string) ($summary['order_no'] ?? ''));
+            if ($orderNo === '') {
+                continue;
+            }
+
+            try {
+                $detailOrder = ratatoskr_fetch_order_detail(
+                    $company,
+                    $orderNo,
+                    (bool) ($summary['received'] ?? false),
+                    trim((string) ($summary['order_date'] ?? '')),
+                    false
+                );
+                $mergedOrder = array_merge($summary, is_array($detailOrder) ? $detailOrder : []);
+                $fetchedOrders[] = ratatoskr_nightly_order_result($mergedOrder);
+
+                $receiptDate = ratatoskr_normalize_date_only(trim((string) ($mergedOrder['receipt_date'] ?? '')));
+                if ($receiptDate !== '') {
+                    $batchReceived[] = ratatoskr_order_to_received_store_row($mergedOrder);
+                }
+            } catch (Throwable $error) {
+                $errors[] = [
+                    'order_no' => $orderNo,
+                    'error' => $error->getMessage(),
+                ];
+                $fetchedOrders[] = ratatoskr_nightly_order_result($summary, $error->getMessage());
+            }
+        }
+
+        if ($batchReceived !== []) {
+            ratatoskr_store_save_received_orders(
+                $company,
+                $batchReceived,
+                ratatoskr_pick_latest_receipt_date($batchReceived)
+            );
+            $syncedReceivedCount += count($batchReceived);
+        }
+    }
+
+    $receivedCount = 0;
+    foreach ($fetchedOrders as $order) {
+        if (!is_array($order)) {
+            continue;
+        }
+
+        if ((bool) ($order['received'] ?? false)) {
+            $receivedCount += 1;
+        }
+    }
+
+    return [
+        'company' => $company,
+        'ok' => $errors === [],
+        'total_orders' => count($summaries),
+        'skipped_cached_count' => $skippedCachedCount,
+        'fetched_count' => count($fetchedOrders),
+        'received_count' => $receivedCount,
+        'synced_received_count' => $syncedReceivedCount,
+        'fetched_orders' => $fetchedOrders,
+        'errors' => $errors,
+    ];
+}

@@ -448,6 +448,7 @@ function ratatoskr_store_save_received_orders(string $company, array $orders, st
     $companyKey = ratatoskr_store_company_key($company);
     $latestReceiptDate = trim($latestReceiptDate);
     $now = gmdate('c');
+    $effectiveLatestReceiptDate = $latestReceiptDate;
 
     try {
         $db = ratatoskr_store_open_db();
@@ -496,13 +497,31 @@ function ratatoskr_store_save_received_orders(string $company, array $orders, st
             }
         }
 
+        $effectiveLatestReceiptDate = $latestReceiptDate;
+        $currentLatestStmt = $db->prepare('SELECT latest_receipt_date FROM sync_state WHERE company = :company LIMIT 1');
+        if ($currentLatestStmt instanceof SQLite3Stmt) {
+            $currentLatestStmt->bindValue(':company', $companyKey, SQLITE3_TEXT);
+            $currentLatestResult = $currentLatestStmt->execute();
+            if ($currentLatestResult instanceof SQLite3Result) {
+                $currentLatestRow = $currentLatestResult->fetchArray(SQLITE3_ASSOC);
+                if (is_array($currentLatestRow)) {
+                    $currentLatestReceiptDate = trim((string) ($currentLatestRow['latest_receipt_date'] ?? ''));
+                    if ($currentLatestReceiptDate !== ''
+                        && ($effectiveLatestReceiptDate === '' || strcmp($currentLatestReceiptDate, $effectiveLatestReceiptDate) > 0)) {
+                        $effectiveLatestReceiptDate = $currentLatestReceiptDate;
+                    }
+                }
+                $currentLatestResult->finalize();
+            }
+        }
+
         $stateStmt = $db->prepare('INSERT INTO sync_state (company, latest_receipt_date, updated_at) VALUES (:company, :latest_receipt_date, :updated_at) ON CONFLICT(company) DO UPDATE SET latest_receipt_date = excluded.latest_receipt_date, updated_at = excluded.updated_at');
         if (!$stateStmt instanceof SQLite3Stmt) {
             throw new RuntimeException('Kon SQLite state-statement niet maken.');
         }
 
         $stateStmt->bindValue(':company', $companyKey, SQLITE3_TEXT);
-        $stateStmt->bindValue(':latest_receipt_date', $latestReceiptDate, SQLITE3_TEXT);
+        $stateStmt->bindValue(':latest_receipt_date', $effectiveLatestReceiptDate, SQLITE3_TEXT);
         $stateStmt->bindValue(':updated_at', $now, SQLITE3_TEXT);
         $result = $stateStmt->execute();
         if ($result instanceof SQLite3Result) {
@@ -521,7 +540,7 @@ function ratatoskr_store_save_received_orders(string $company, array $orders, st
 
     $state = ratatoskr_store_state_read();
     $state[$companyKey] = [
-        'latest_received_date' => $latestReceiptDate,
+        'latest_received_date' => $effectiveLatestReceiptDate,
         'updated_at' => $now,
     ];
     $saved = ratatoskr_store_state_write($state);

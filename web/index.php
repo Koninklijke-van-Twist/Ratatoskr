@@ -113,6 +113,25 @@ function ratatoskr_runtime_error_payload(Throwable $error, string $message, int 
     ], $statusCode);
 }
 
+function ratatoskr_vendor_product_stats_payload(string $company): array
+{
+    $raw = (string) ($_POST['orders_json'] ?? '');
+    if ($raw === '') {
+        throw new RuntimeException('Orders ontbreken.');
+    }
+
+    $decoded = json_decode($raw, true);
+    if (!is_array($decoded)) {
+        throw new RuntimeException('Ongeldige JSON voor orders.');
+    }
+
+    return [
+        'ok' => true,
+        'company' => $company,
+        'products' => ratatoskr_vendor_product_stats($company, $decoded),
+    ];
+}
+
 function ratatoskr_sync_received_orders_payload(string $company): array
 {
     $raw = (string) ($_POST['orders_json'] ?? '');
@@ -257,6 +276,19 @@ if (ratatoskr_action_is('sync_received_orders')) {
         ratatoskr_send_json(ratatoskr_sync_received_orders_payload($company));
     } catch (Throwable $error) {
         ratatoskr_runtime_error_payload($error, 'Opslaan van ontvangen orders mislukt.');
+    }
+}
+
+if (ratatoskr_action_is('vendor_product_stats')) {
+    $company = trim((string) ($_POST['company'] ?? ''));
+    if ($company === '' || !in_array($company, $companies, true)) {
+        ratatoskr_send_json(['ok' => false, 'error' => 'Kies een geldig bedrijf.'], 400);
+    }
+
+    try {
+        ratatoskr_send_json(ratatoskr_vendor_product_stats_payload($company));
+    } catch (Throwable $error) {
+        ratatoskr_runtime_error_payload($error, 'Productstatistieken ophalen mislukt.');
     }
 }
 ?>
@@ -905,8 +937,17 @@ if (ratatoskr_action_is('sync_received_orders')) {
             font-size: 13px;
         }
 
-        .stats-note {
-            margin: 12px 0 0;
+        .filter-controls {
+            margin-top: 0;
+        }
+
+        .stats-product-name {
+            font-weight: 700;
+        }
+
+        .stats-product-meta {
+            display: block;
+            margin-top: 2px;
             font-size: 12px;
             color: var(--muted);
         }
@@ -1040,10 +1081,20 @@ if (ratatoskr_action_is('sync_received_orders')) {
                 </div>
 
                 <div class="field" style="margin-top:10px;">
-                    <label class="toggle-field" for="receivedOnlyToggle">
-                        <input type="checkbox" id="receivedOnlyToggle" autocomplete="off">
-                        Alleen reeds ontvangen orders tonen
-                    </label>
+                    <label for="receivedFilter">Ontvangstfilter</label>
+                    <select id="receivedFilter" autocomplete="off">
+                        <option value="all">Alle orders tonen</option>
+                        <option value="received">Alleen ontvangen</option>
+                        <option value="not_received">Alleen niet ontvangen</option>
+                    </select>
+                </div>
+
+                <div class="field" style="margin-top:10px;">
+                    <label for="minLeadDaysInput">Levertijdfilter (besteld → ontvangen)</label>
+                    <div class="controls-grid filter-controls">
+                        <input id="minLeadDaysInput" type="number" min="0" step="1" placeholder="Meer dan … dagen" autocomplete="off">
+                        <button id="applyMinLeadDaysButton" class="btn-ghost" type="button">Filter toepassen</button>
+                    </div>
                 </div>
 
                 <div class="field" style="margin-top:10px;">
@@ -1099,6 +1150,10 @@ if (ratatoskr_action_is('sync_received_orders')) {
                         <h3>Gemiddelde doorlooptijd</h3>
                         <div id="vendorStatsArea"></div>
                     </div>
+                    <div class="stats-card stats-card-full">
+                        <h3>Per product (afgelopen jaar)</h3>
+                        <div id="vendorProductStatsArea"></div>
+                    </div>
                 </div>
             </div>
         </div>
@@ -1109,7 +1164,9 @@ if (ratatoskr_action_is('sync_received_orders')) {
         {
             const companySelect = document.getElementById('companySelect');
             const loadOrdersButton = document.getElementById('loadOrdersButton');
-            const receivedOnlyToggle = document.getElementById('receivedOnlyToggle');
+            const receivedFilter = document.getElementById('receivedFilter');
+            const minLeadDaysInput = document.getElementById('minLeadDaysInput');
+            const applyMinLeadDaysButton = document.getElementById('applyMinLeadDaysButton');
             const orderSearchInput = document.getElementById('orderSearchInput');
             const statusText = document.getElementById('statusText');
             const orderList = document.getElementById('orderList');
@@ -1125,11 +1182,15 @@ if (ratatoskr_action_is('sync_received_orders')) {
             const vendorModalSubtitle = document.getElementById('vendorModalSubtitle');
             const vendorModalClose = document.getElementById('vendorModalClose');
             const vendorStatsArea = document.getElementById('vendorStatsArea');
+            const vendorProductStatsArea = document.getElementById('vendorProductStatsArea');
+
+            const ORDER_DETAIL_BATCH_SIZE = 10;
 
             const state = {
                 orders: [],
                 allOrders: [],
-                receivedOnly: false,
+                receivedFilter: 'all',
+                minLeadDays: null,
                 searchQuery: '',
                 loading: false,
                 renderedOrderNos: new Set(),
@@ -1352,14 +1413,45 @@ if (ratatoskr_action_is('sync_received_orders')) {
                 });
             }
 
+            function orderLeadDays (order)
+            {
+                const orderMs = parseDateOnly(order.order_date);
+                const receiptMs = parseDateOnly(order.receipt_date);
+                if (orderMs === null || receiptMs === null)
+                {
+                    return null;
+                }
+
+                return (receiptMs - orderMs) / 86400000;
+            }
+
+            function isOrderReceived (order)
+            {
+                return String(order.receipt_date || '').trim() !== '';
+            }
+
             function visibleOrdersFromState ()
             {
                 const sourceOrders = Array.isArray(state.allOrders) ? state.allOrders : [];
                 return sourceOrders.filter(function (order)
                 {
-                    if (state.receivedOnly && String(order.receipt_date || '').trim() === '')
+                    if (state.receivedFilter === 'received' && !isOrderReceived(order))
                     {
                         return false;
+                    }
+
+                    if (state.receivedFilter === 'not_received' && isOrderReceived(order))
+                    {
+                        return false;
+                    }
+
+                    if (state.minLeadDays !== null && Number.isFinite(state.minLeadDays))
+                    {
+                        const leadDays = orderLeadDays(order);
+                        if (leadDays === null || leadDays <= state.minLeadDays)
+                        {
+                            return false;
+                        }
                     }
 
                     const query = String(state.searchQuery || '').trim().toLowerCase();
@@ -1428,7 +1520,7 @@ if (ratatoskr_action_is('sync_received_orders')) {
                 const recheckButton = String(order.source || '').trim() === 'permanent'
                     ? '<button type="button" class="recheck-button" data-order-no="' + orderNo + '">Opnieuw controleren</button>'
                     : '';
-                const shipmentClass = isReceivedWithoutShipment ? 'date-box date-box-warning' : 'date-box';
+                const shipmentClass = 'date-box';
                 const receiptClass = permanentUnknownReceipt ? 'date-box date-box-danger' : 'date-box';
 
                 return '<li class="order-card" data-order-no="' + orderNo + '" style="animation-delay:' + Math.min(index * 18, 220) + 'ms">'
@@ -1636,16 +1728,28 @@ if (ratatoskr_action_is('sync_received_orders')) {
 
             function applyLiveFilters ()
             {
-                state.receivedOnly = !!(receivedOnlyToggle && receivedOnlyToggle.checked);
+                state.receivedFilter = String((receivedFilter && receivedFilter.value) || 'all').trim();
+                if (state.receivedFilter !== 'received' && state.receivedFilter !== 'not_received')
+                {
+                    state.receivedFilter = 'all';
+                }
                 state.searchQuery = String((orderSearchInput && orderSearchInput.value) || '').trim();
                 renderOrders();
 
                 if (state.allOrders.length > 0)
                 {
                     const parts = [];
-                    if (state.receivedOnly)
+                    if (state.receivedFilter === 'received')
                     {
                         parts.push('alleen ontvangen');
+                    }
+                    else if (state.receivedFilter === 'not_received')
+                    {
+                        parts.push('alleen niet ontvangen');
+                    }
+                    if (state.minLeadDays !== null && Number.isFinite(state.minLeadDays))
+                    {
+                        parts.push('levertijd > ' + state.minLeadDays + ' dagen');
                     }
                     if (state.searchQuery !== '')
                     {
@@ -1655,6 +1759,22 @@ if (ratatoskr_action_is('sync_received_orders')) {
                     const suffix = parts.length > 0 ? ' (' + parts.join(', ') + ').' : '.';
                     setStatus(state.orders.length + ' zichtbare orders' + suffix, false);
                 }
+            }
+
+            function applyMinLeadDaysFilter ()
+            {
+                const rawValue = String((minLeadDaysInput && minLeadDaysInput.value) || '').trim();
+                if (rawValue === '')
+                {
+                    state.minLeadDays = null;
+                }
+                else
+                {
+                    const parsed = Number(rawValue);
+                    state.minLeadDays = Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
+                }
+
+                applyLiveFilters();
             }
 
             function periodLabel (monthsBack)
@@ -1707,7 +1827,7 @@ if (ratatoskr_action_is('sync_received_orders')) {
             {
                 const vendorKey = String(vendorNo || '').trim().toLowerCase();
                 const vendorLabel = String(vendorName || '').trim();
-                const vendorOrders = state.orders.filter(function (order)
+                const vendorOrders = (Array.isArray(state.allOrders) ? state.allOrders : []).filter(function (order)
                 {
                     const orderVendorNo = String(order.vendor_no || '').trim().toLowerCase();
                     const orderVendorName = String(order.vendor_name || '').trim().toLowerCase();
@@ -1748,7 +1868,7 @@ if (ratatoskr_action_is('sync_received_orders')) {
                         return shipMs === null || receiptMs === null ? NaN : (receiptMs - shipMs) / 86400000;
                     });
 
-                    const totalLead = averageDuration(periodOrders, function (order)
+                    const orderToReceipt = averageDuration(periodOrders, function (order)
                     {
                         return parseDateOnly(order.order_date) !== null && parseDateOnly(order.receipt_date) !== null;
                     }, function (order)
@@ -1767,7 +1887,7 @@ if (ratatoskr_action_is('sync_received_orders')) {
                         }).length,
                         orderToShip: orderToShip,
                         shipToReceipt: shipToReceipt,
-                        totalLead: totalLead,
+                        orderToReceipt: orderToReceipt,
                     };
                 });
 
@@ -1775,6 +1895,80 @@ if (ratatoskr_action_is('sync_received_orders')) {
                     vendorName: vendorLabel || vendorKey || 'Onbekende leverancier',
                     stats: ranges,
                 };
+            }
+
+            function vendorOrdersForProductStats (vendorNo, vendorName)
+            {
+                const vendorKey = String(vendorNo || '').trim().toLowerCase();
+                const vendorLabel = String(vendorName || '').trim().toLowerCase();
+                const yearStartMs = startForPeriod(12);
+
+                return (Array.isArray(state.allOrders) ? state.allOrders : []).filter(function (order)
+                {
+                    const orderVendorNo = String(order.vendor_no || '').trim().toLowerCase();
+                    const orderVendorName = String(order.vendor_name || '').trim().toLowerCase();
+                    const matchesVendor = vendorKey !== ''
+                        ? orderVendorNo === vendorKey
+                        : orderVendorName === vendorLabel;
+                    if (!matchesVendor)
+                    {
+                        return false;
+                    }
+
+                    const orderMs = parseDateOnly(order.order_date);
+                    return orderMs !== null && orderMs >= yearStartMs;
+                }).map(function (order)
+                {
+                    return {
+                        order_no: String(order.order_no || '').trim(),
+                        order_date: String(order.order_date || '').trim(),
+                        shipment_date: String(order.shipment_date || '').trim(),
+                        receipt_date: String(order.receipt_date || '').trim(),
+                    };
+                });
+            }
+
+            function renderVendorStatsTable (rows, includeProductColumn)
+            {
+                let html = '<table class="stats-table"><thead><tr>';
+                if (includeProductColumn)
+                {
+                    html += '<th>Product</th>';
+                }
+                else
+                {
+                    html += '<th>Periode</th>';
+                }
+                html += '<th>Besteld → verstuurd</th><th>Verstuurd → ontvangen</th><th>Besteld → ontvangen</th><th>Orders</th><th>Waarvan ontvangen</th></tr></thead><tbody>';
+
+                for (const row of rows)
+                {
+                    html += '<tr>';
+                    if (includeProductColumn)
+                    {
+                        const productLabel = String(row.description || row.item_no || 'Onbekend product');
+                        const productMeta = String(row.item_no || '').trim();
+                        html += '<td><span class="stats-product-name">' + escapeHtml(productLabel) + '</span>';
+                        if (productMeta !== '' && productMeta !== productLabel)
+                        {
+                            html += '<span class="stats-product-meta">' + escapeHtml(productMeta) + '</span>';
+                        }
+                        html += '</td>';
+                    }
+                    else
+                    {
+                        html += '<td>' + escapeHtml(row.label) + '</td>';
+                    }
+                    html += '<td>' + escapeHtml(formatDurationDays(row.orderToShip)) + '</td>'
+                        + '<td>' + escapeHtml(formatDurationDays(row.shipToReceipt)) + '</td>'
+                        + '<td>' + escapeHtml(formatDurationDays(row.orderToReceipt)) + '</td>'
+                        + '<td>' + escapeHtml(String(row.totalOrders || 0)) + '</td>'
+                        + '<td>' + escapeHtml(String(row.receivedOrders || 0)) + '</td>'
+                        + '</tr>';
+                }
+
+                html += '</tbody></table>';
+                return html;
             }
 
             function renderVendorStats (payload)
@@ -1786,30 +1980,51 @@ if (ratatoskr_action_is('sync_received_orders')) {
                     return;
                 }
 
-                let html = '<table class="stats-table"><thead><tr><th>Periode</th><th>Bestelling → versturen</th><th>Versturen → ontvangen</th><th>Totaal</th><th>Totaal orders</th><th>Waarvan reeds ontvangen</th></tr></thead><tbody>';
-                for (const row of rows)
-                {
-                    html += '<tr>'
-                        + '<td>' + escapeHtml(row.label) + '</td>'
-                        + '<td>' + escapeHtml(formatDurationDays(row.orderToShip)) + '</td>'
-                        + '<td>' + escapeHtml(formatDurationDays(row.shipToReceipt)) + '</td>'
-                        + '<td>' + escapeHtml(formatDurationDays(row.totalLead)) + '</td>'
-                        + '<td>' + escapeHtml(String(row.totalOrders || 0)) + '</td>'
-                        + '<td>' + escapeHtml(String(row.receivedOrders || 0)) + '</td>'
-                        + '</tr>';
-                }
-                html += '</tbody></table>';
-                vendorStatsArea.innerHTML = html;
+                vendorStatsArea.innerHTML = renderVendorStatsTable(rows, false);
             }
 
-            function openVendorModal (vendorNo, vendorName)
+            function renderVendorProductStats (products)
+            {
+                const rows = Array.isArray(products) ? products : [];
+                if (rows.length === 0)
+                {
+                    vendorProductStatsArea.innerHTML = '<div class="stats-empty">Geen productgegevens gevonden voor deze leverancier in het afgelopen jaar.</div>';
+                    return;
+                }
+
+                vendorProductStatsArea.innerHTML = renderVendorStatsTable(rows, true);
+            }
+
+            async function openVendorModal (vendorNo, vendorName)
             {
                 const payload = calculateVendorStats(vendorNo, vendorName);
                 vendorModalTitle.textContent = 'Leveranciersstatistieken';
                 vendorModalSubtitle.textContent = payload.vendorName;
                 renderVendorStats(payload);
+                vendorProductStatsArea.innerHTML = '<div class="stats-empty">Productstatistieken laden...</div>';
                 vendorModal.classList.add('is-visible');
                 vendorModal.querySelector('.modal-card').focus({ preventScroll: true });
+
+                const company = String(companySelect.value || '').trim();
+                const ordersForStats = vendorOrdersForProductStats(vendorNo, vendorName);
+                if (company === '' || ordersForStats.length === 0)
+                {
+                    renderVendorProductStats([]);
+                    return;
+                }
+
+                try
+                {
+                    const productPayload = await postJson('index.php?action=vendor_product_stats', {
+                        company: company,
+                        orders_json: JSON.stringify(ordersForStats),
+                    });
+                    renderVendorProductStats(productPayload && productPayload.products ? productPayload.products : []);
+                }
+                catch (error)
+                {
+                    vendorProductStatsArea.innerHTML = '<div class="stats-empty">' + escapeHtml((error && error.message) ? error.message : 'Productstatistieken konden niet worden geladen.') + '</div>';
+                }
             }
 
             function closeVendorModal ()
@@ -1875,6 +2090,175 @@ if (ratatoskr_action_is('sync_received_orders')) {
                 }
             }
 
+            function chunkArray (items, size)
+            {
+                const safeItems = Array.isArray(items) ? items : [];
+                const safeSize = Math.max(1, Number(size) || 1);
+                const chunks = [];
+
+                for (let index = 0; index < safeItems.length; index += safeSize)
+                {
+                    chunks.push(safeItems.slice(index, index + safeSize));
+                }
+
+                return chunks;
+            }
+
+            function createOrderIndexMap ()
+            {
+                const indexByKey = new Map();
+                state.allOrders.forEach(function (order, index)
+                {
+                    const key = orderKey(order.order_no);
+                    if (key !== '')
+                    {
+                        indexByKey.set(key, index);
+                    }
+                });
+
+                return indexByKey;
+            }
+
+            function upsertOrderIntoState (order, indexByKey)
+            {
+                const normalizedOrder = normalizeOrder(order, order);
+                const key = orderKey(normalizedOrder.order_no);
+                if (key === '')
+                {
+                    return false;
+                }
+
+                const existingIndex = indexByKey.has(key) ? indexByKey.get(key) : -1;
+                if (!Number.isInteger(existingIndex) || existingIndex < 0)
+                {
+                    indexByKey.set(key, state.allOrders.length);
+                    state.allOrders.push(normalizedOrder);
+                    return true;
+                }
+
+                state.allOrders[existingIndex] = Object.assign({}, state.allOrders[existingIndex], normalizedOrder);
+                return true;
+            }
+
+            function applyOrdersToState (orders, indexByKey)
+            {
+                let changed = false;
+                (Array.isArray(orders) ? orders : []).forEach(function (order)
+                {
+                    if (upsertOrderIntoState(order, indexByKey))
+                    {
+                        changed = true;
+                    }
+                });
+
+                if (changed)
+                {
+                    state.allOrders = sortOrders(state.allOrders);
+                    indexByKey.clear();
+                    createOrderIndexMap().forEach(function (index, key)
+                    {
+                        indexByKey.set(key, index);
+                    });
+                }
+
+                return changed;
+            }
+
+            function updateDetailLoaderProgress (completedCount, totalOrders, detailText)
+            {
+                const detailPercent = totalOrders > 0 ? (completedCount / totalOrders) * 100 : 100;
+                setLoaderSteps(['Historische orders geladen', 'Orderdetails laden', 'Lijst tonen'], 1, detailPercent);
+                updateLoaderProgress(completedCount, totalOrders, detailText || ('Order ' + completedCount + ' van ' + totalOrders + ' (' + Math.round(detailPercent) + '%).'));
+            }
+
+            async function fetchOrderDetail (company, summary)
+            {
+                const orderNo = String((summary && summary.order_no) || '').trim();
+                if (orderNo === '')
+                {
+                    return null;
+                }
+
+                try
+                {
+                    const detailPayload = await postJson('index.php?action=order_detail', {
+                        company: company,
+                        order_no: orderNo,
+                        order_date: String(summary.order_date || '').trim(),
+                        received: summary.received ? '1' : '0',
+                    });
+
+                    const detailOrder = detailPayload && detailPayload.order ? detailPayload.order : {};
+                    return normalizeOrder(summary, detailOrder);
+                }
+                catch (error)
+                {
+                    return normalizeOrder(summary, {
+                        shipment_date: '',
+                        receipt_date: '',
+                        load_error: (error && error.message) ? error.message : 'Orderdetails konden niet worden geladen.',
+                    });
+                }
+            }
+
+            function latestReceiptDateFromOrders (orders)
+            {
+                let latestReceiptDate = '';
+                (Array.isArray(orders) ? orders : []).forEach(function (order)
+                {
+                    const receiptDate = String((order && order.receipt_date) || '').trim();
+                    if (receiptDate !== '' && (latestReceiptDate === '' || receiptDate > latestReceiptDate))
+                    {
+                        latestReceiptDate = receiptDate;
+                    }
+                });
+
+                return latestReceiptDate;
+            }
+
+            async function syncReceivedOrdersBatch (company, orders)
+            {
+                const receivedOrders = (Array.isArray(orders) ? orders : []).filter(function (order)
+                {
+                    return String((order && order.receipt_date) || '').trim() !== '';
+                });
+                if (receivedOrders.length === 0)
+                {
+                    return 0;
+                }
+
+                const latestReceiptDate = latestReceiptDateFromOrders(receivedOrders);
+                if (latestReceiptDate === '')
+                {
+                    return 0;
+                }
+
+                const syncPayload = await postJson('index.php?action=sync_received_orders', {
+                    company: company,
+                    latest_received_date: latestReceiptDate,
+                    orders_json: JSON.stringify(receivedOrders),
+                });
+
+                return Number((syncPayload && syncPayload.saved_count) || receivedOrders.length) || 0;
+            }
+
+            function sortSummariesOldestFirst (summaries)
+            {
+                return (Array.isArray(summaries) ? summaries.slice() : []).sort(function (left, right)
+                {
+                    const leftOrderDate = parseDateOnly(left.order_date);
+                    const rightOrderDate = parseDateOnly(right.order_date);
+                    const leftSort = leftOrderDate !== null ? leftOrderDate : Number.MAX_SAFE_INTEGER;
+                    const rightSort = rightOrderDate !== null ? rightOrderDate : Number.MAX_SAFE_INTEGER;
+                    if (leftSort !== rightSort)
+                    {
+                        return leftSort - rightSort;
+                    }
+
+                    return String(left.order_no || '').localeCompare(String(right.order_no || ''), 'nl', { numeric: true, sensitivity: 'base' });
+                });
+            }
+
             async function loadOrders ()
             {
                 const company = String(companySelect.value || '').trim();
@@ -1900,7 +2284,7 @@ if (ratatoskr_action_is('sync_received_orders')) {
                     });
                     const detailSummaries = summaries.filter(function (order)
                     {
-                        return !order || order.needs_detail !== false;
+                        return Boolean(order && order.needs_detail !== false && String(order.order_no || '').trim() !== '');
                     });
                     if (summaries.length === 0)
                     {
@@ -1910,120 +2294,57 @@ if (ratatoskr_action_is('sync_received_orders')) {
                         return;
                     }
 
-                    const upsertOrder = function (order)
-                    {
-                        const normalizedOrder = normalizeOrder(order, order);
-                        const orderNo = String(normalizedOrder.order_no || '').trim();
-                        if (orderNo === '')
-                        {
-                            return;
-                        }
-
-                        const existingIndex = state.allOrders.findIndex(function (item)
-                        {
-                            return String(item.order_no || '').trim().toLowerCase() === orderNo.toLowerCase();
-                        });
-
-                        if (existingIndex === -1)
-                        {
-                            state.allOrders.push(normalizedOrder);
-                        }
-                        else
-                        {
-                            state.allOrders[existingIndex] = Object.assign({}, state.allOrders[existingIndex], normalizedOrder);
-                        }
-
-                        state.allOrders = sortOrders(state.allOrders);
-                        renderOrders();
-                    };
-
                     state.allOrders = [];
-                    storedSummaries.forEach(function (order)
-                    {
-                        upsertOrder(order);
-                    });
+                    const orderIndexByKey = createOrderIndexMap();
+                    applyOrdersToState(storedSummaries, orderIndexByKey);
+                    renderOrders();
 
                     const totalOrders = Math.max(1, summaries.length);
+                    const storedCount = storedSummaries.length;
+                    let completedCount = storedCount;
                     setLoaderSteps(['Historische orders laden', 'Orderdetails laden', 'Lijst tonen'], 1, 0);
-                    updateLoaderProgress(storedSummaries.length, totalOrders, storedSummaries.length + ' historische orders geladen.');
+                    updateDetailLoaderProgress(completedCount, totalOrders, storedCount + ' historische orders geladen.');
 
-                    for (let index = 0; index < detailSummaries.length; index += 1)
+                    const detailBatches = chunkArray(sortSummariesOldestFirst(detailSummaries), ORDER_DETAIL_BATCH_SIZE);
+                    let syncedReceivedCount = 0;
+                    for (let batchIndex = 0; batchIndex < detailBatches.length; batchIndex += 1)
                     {
-                        const summary = detailSummaries[index] || {};
-                        const orderNo = String(summary.order_no || '').trim();
-                        if (orderNo === '')
+                        const batch = detailBatches[batchIndex] || [];
+                        const batchResults = await Promise.all(batch.map(function (summary)
                         {
-                            continue;
-                        }
+                            return fetchOrderDetail(company, summary);
+                        }));
+                        const normalizedBatch = batchResults.filter(Boolean);
 
-                        const detailPercent = totalOrders > 0 ? ((storedSummaries.length + index + 1) / totalOrders) * 100 : 100;
-                        setLoaderSteps(['Historische orders geladen', 'Orderdetails laden', 'Lijst tonen'], 1, detailPercent);
-                        updateLoaderProgress(storedSummaries.length + index + 1, totalOrders, 'Order ' + (storedSummaries.length + index + 1) + ' van ' + totalOrders + ' (' + Math.round(detailPercent) + '%): ' + orderNo);
+                        applyOrdersToState(normalizedBatch, orderIndexByKey);
                         try
                         {
-                            const detailPayload = await postJson('index.php?action=order_detail', {
-                                company: company,
-                                order_no: orderNo,
-                                order_date: String(summary.order_date || '').trim(),
-                                received: summary.received ? '1' : '0',
-                            });
-
-                            const detailOrder = detailPayload && detailPayload.order ? detailPayload.order : {};
-                            upsertOrder(normalizeOrder(summary, detailOrder));
-                        } catch (error)
-                        {
-                            upsertOrder(normalizeOrder(summary, {
-                                shipment_date: '',
-                                receipt_date: '',
-                                load_error: (error && error.message) ? error.message : 'Orderdetails konden niet worden geladen.',
-                            }));
+                            syncedReceivedCount += await syncReceivedOrdersBatch(company, normalizedBatch);
                         }
+                        catch (error)
+                        {
+                            void error;
+                        }
+
+                        completedCount += batch.length;
+                        const batchStart = completedCount - batch.length + 1;
+                        updateDetailLoaderProgress(
+                            completedCount,
+                            totalOrders,
+                            'Batch ' + (batchIndex + 1) + ' van ' + detailBatches.length + ': orders ' + batchStart + '-' + completedCount + ' van ' + totalOrders + '.'
+                        );
+                        renderOrders();
                     }
 
                     const detailedOrders = sortOrders(state.allOrders.slice());
                     state.allOrders = detailedOrders;
                     renderOrders();
-                    setStatus(detailedOrders.length + ' orders geladen voor ' + company + '.', false);
+                    const statusSuffix = syncedReceivedCount > 0
+                        ? (' ' + syncedReceivedCount + ' ontvangen orders gesynchroniseerd.')
+                        : '';
+                    setStatus(detailedOrders.length + ' orders geladen voor ' + company + '.' + statusSuffix, false);
                     setLoaderSteps(['SQLite geladen', 'Orderdetails geladen', 'Lijst getoond'], 2, 100);
                     updateLoaderProgress(detailedOrders.length, detailedOrders.length, 'Klaar.');
-
-                    const receivedOrders = detailedOrders.filter(function (order)
-                    {
-                        return String(order.receipt_date || '').trim() !== '';
-                    });
-                    if (receivedOrders.length > 0)
-                    {
-                        let latestReceiptDate = '';
-                        for (const order of receivedOrders)
-                        {
-                            const receiptDate = String(order.receipt_date || '').trim();
-                            if (receiptDate !== '' && (latestReceiptDate === '' || receiptDate > latestReceiptDate))
-                            {
-                                latestReceiptDate = receiptDate;
-                            }
-                        }
-
-                        if (latestReceiptDate !== '')
-                        {
-                            try
-                            {
-                                const syncPayload = await postJson('index.php?action=sync_received_orders', {
-                                    company: company,
-                                    latest_received_date: latestReceiptDate,
-                                    orders_json: JSON.stringify(receivedOrders),
-                                });
-
-                                if (syncPayload && syncPayload.ok)
-                                {
-                                    setStatus(detailedOrders.length + ' orders geladen voor ' + company + '. ' + String(syncPayload.saved_count || receivedOrders.length) + ' ontvangen orders gesynchroniseerd.', false);
-                                }
-                            }
-                            catch (error)
-                            {
-                                setStatus((error && error.message) ? error.message : 'Ontvangen orders konden niet worden opgeslagen.', true);
-                            }
-                        }
-                    }
                 } catch (error)
                 {
                     setStatus((error && error.message) ? error.message : 'Laden mislukt.', true);
@@ -2062,9 +2383,26 @@ if (ratatoskr_action_is('sync_received_orders')) {
                 void loadOrders();
             });
 
-            if (receivedOnlyToggle)
+            if (receivedFilter)
             {
-                receivedOnlyToggle.addEventListener('change', applyLiveFilters);
+                receivedFilter.addEventListener('change', applyLiveFilters);
+            }
+
+            if (applyMinLeadDaysButton)
+            {
+                applyMinLeadDaysButton.addEventListener('click', applyMinLeadDaysFilter);
+            }
+
+            if (minLeadDaysInput)
+            {
+                minLeadDaysInput.addEventListener('keydown', function (event)
+                {
+                    if (event.key === 'Enter')
+                    {
+                        event.preventDefault();
+                        applyMinLeadDaysFilter();
+                    }
+                });
             }
 
             if (orderSearchInput)
@@ -2090,7 +2428,7 @@ if (ratatoskr_action_is('sync_received_orders')) {
 
                 const vendorNo = String(button.getAttribute('data-vendor-no') || '').trim();
                 const vendorName = String(button.getAttribute('data-vendor-name') || button.textContent || '').trim();
-                openVendorModal(vendorNo, vendorName);
+                void openVendorModal(vendorNo, vendorName);
             });
 
             vendorModalClose.addEventListener('click', closeVendorModal);
