@@ -56,7 +56,8 @@ function ratatoskr_company_entity_url_with_query(string $company, string $entity
     }
 
     $base = trim((string) ($baseUrl ?? ''));
-    if ($base === '') {
+    // Lege $baseUrl is geldig in Mímir-modus; odata_get_all vertaalt het pad.
+    if ($base === '' && !(function_exists('odata_mimir_enabled') && odata_mimir_enabled())) {
         throw new RuntimeException('baseUrl ontbreekt in auth.php.');
     }
 
@@ -257,6 +258,11 @@ function ratatoskr_ttl_for_open_order_age(?int $ageDays): int
 
 function ratatoskr_odata_get_all_uncached(string $url, array $auth): array
 {
+    if (function_exists('odata_mimir_enabled') && odata_mimir_enabled() && function_exists('odata_mimir_fetch_all')) {
+        // Geen lokale filecache en geen BC-call. max_age 0 vraagt Mímir om verse data.
+        return odata_mimir_fetch_all($url, 0);
+    }
+
     $all = [];
     $next = $url;
 
@@ -289,6 +295,16 @@ function ratatoskr_odata_is_valid_cache_entry(string $url, array $auth, int $ttl
 
 function ratatoskr_odata_get_all_with_cache_flag(string $url, array $auth, int $ttlSeconds): array
 {
+    if (function_exists('odata_mimir_enabled') && odata_mimir_enabled()) {
+        // Mímir beheert de cache. from_cache blijft true zodat de debug-bol
+        // niet op elke order gaat branden; de lokale filecache wordt niet gelezen.
+        $rows = odata_get_all($url, $auth, max(0, $ttlSeconds));
+        return [
+            'rows' => $rows,
+            'from_cache' => true,
+        ];
+    }
+
     $safeTtl = max(1, $ttlSeconds);
     $cacheKey = build_cache_key($url, $auth);
     $cachePath = cache_path_for_key($cacheKey);
