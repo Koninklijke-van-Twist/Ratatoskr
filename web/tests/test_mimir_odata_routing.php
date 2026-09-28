@@ -476,6 +476,9 @@ try {
     test_assert('Bearer en X-API-Key', $sawBearer);
 
     test_reset_discovery_cache();
+    if (function_exists('odata_mimir_circuit_reset')) {
+        odata_mimir_circuit_reset();
+    }
     $mimirBase = 'http://127.0.0.1:' . $mockPort . '/mimir-redirect/api';
     $redirectThrew = false;
     try {
@@ -486,6 +489,9 @@ try {
     test_assert('Mímir-request volgt geen redirect', $redirectThrew);
 
     test_reset_discovery_cache();
+    if (function_exists('odata_mimir_circuit_reset')) {
+        odata_mimir_circuit_reset();
+    }
     $mimirBase = 'http://127.0.0.1:' . $mockPort . '/mimir-dup/api';
     $overlapThrew = false;
     try {

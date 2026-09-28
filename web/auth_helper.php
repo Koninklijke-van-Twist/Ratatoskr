@@ -50,6 +50,12 @@ function auth_mimir_enabled(): bool
     return function_exists('odata_mimir_enabled') && odata_mimir_enabled();
 }
 
+function auth_mimir_circuit_is_open(): bool
+{
+    auth_ensure_odata_loaded();
+    return function_exists('odata_mimir_circuit_open') && odata_mimir_circuit_open();
+}
+
 /**
  * Geeft de actieve environments terug op basis van config.
  */
@@ -79,7 +85,8 @@ function auth_get_active_environments(): array
     }
 
     // Geen lokale BC-config: bij Mímir environments afleiden uit companies.php.
-    if (auth_mimir_enabled()) {
+    // Na een Mímir-fout in dit proces blijft de lokale BC-config leidend.
+    if (auth_mimir_enabled() && !auth_mimir_circuit_is_open()) {
         $cached = $GLOBALS['demeter_active_environments'] ?? null;
         if (is_array($cached) && $cached !== []) {
             return array_values(array_map('strval', $cached));
@@ -114,8 +121,10 @@ function auth_get_auth_for_environment(string $environment): array
     $environmentKey = trim($environment);
     $list = is_array($auth_list ?? null) ? $auth_list : [];
 
+    $mimirWithoutFallback = auth_mimir_enabled() && !auth_mimir_circuit_is_open();
+
     if ($environmentKey === '') {
-        if (auth_mimir_enabled()) {
+        if ($mimirWithoutFallback) {
             return [];
         }
         throw new RuntimeException('Environment ontbreekt in auth-configuratie.');
@@ -124,7 +133,8 @@ function auth_get_auth_for_environment(string $environment): array
     $auth = $list[$environmentKey] ?? null;
     if (!is_array($auth)) {
         // Mímir-modus zonder BC-auth: leftover callers krijgen lege auth i.p.v. exception.
-        if (auth_mimir_enabled()) {
+        // Zodra Mímir is uitgevallen gelden weer de gewone BC-credentials.
+        if ($mimirWithoutFallback) {
             return [];
         }
         throw new RuntimeException('Geen auth-configuratie gevonden voor environment: ' . $environmentKey);
@@ -283,7 +293,11 @@ function auth_discover_companies_via_mimir(): array
         throw new RuntimeException('Mímir company-discovery vereist odata.php.');
     }
 
-    $rows = odata_mimir_companies_as_rows(null);
+    if (function_exists('odata_mimir_companies_as_rows_impl')) {
+        $rows = odata_mimir_companies_as_rows_impl(null);
+    } else {
+        $rows = odata_mimir_companies_as_rows(null);
+    }
     $companiesByEnvironment = [];
     $companyToEnvironment = [];
     $duplicates = [];
@@ -390,11 +404,51 @@ function auth_discover_companies_via_mimir(): array
  */
 function auth_discover_companies_across_active_environments(int $ttlSeconds = 300): array
 {
-    // Mímir: companies + environments uit Mímir API — geen $auth_list/$baseUrl nodig.
+    // Mímir eerst. Bij een transportfout de pre-Mímir BC-discovery (auth_list + baseUrl).
+    if (auth_mimir_enabled() && function_exists('odata_mimir_or_direct')) {
+        if (auth_mimir_circuit_is_open()) {
+            if (!function_exists('odata_bc_credentials_configured') || !odata_bc_credentials_configured()) {
+                $original = function_exists('odata_mimir_last_error') ? odata_mimir_last_error() : null;
+                if ($original instanceof Throwable) {
+                    throw $original;
+                }
+                throw new RuntimeException('Mímir eerder mislukt.');
+            }
+            if (function_exists('odata_mimir_log_fallback')) {
+                $original = function_exists('odata_mimir_last_error') ? odata_mimir_last_error() : null;
+                odata_mimir_log_fallback($original instanceof Throwable ? $original : new Exception('Mímir overgeslagen na eerdere fout.'));
+            }
+            return auth_discover_companies_from_bc($ttlSeconds);
+        }
+
+        try {
+            return auth_discover_companies_via_mimir();
+        } catch (Throwable $exception) {
+            if (!auth_mimir_circuit_is_open()) {
+                throw $exception;
+            }
+            if (!function_exists('odata_bc_credentials_configured') || !odata_bc_credentials_configured()) {
+                throw $exception;
+            }
+            if (function_exists('odata_mimir_log_fallback')) {
+                odata_mimir_log_fallback($exception);
+            }
+            return auth_discover_companies_from_bc($ttlSeconds);
+        }
+    }
+
     if (auth_mimir_enabled()) {
         return auth_discover_companies_via_mimir();
     }
 
+    return auth_discover_companies_from_bc($ttlSeconds);
+}
+
+/**
+ * Pre-Mímir company-discovery: elke actieve environment via OData Company/Companies.
+ */
+function auth_discover_companies_from_bc(int $ttlSeconds = 300): array
+{
     $activeEnvironments = auth_get_active_environments();
     if ($activeEnvironments === []) {
         throw new RuntimeException('Geen actieve environments geconfigureerd.');
@@ -552,7 +606,7 @@ function auth_set_current_company_context(?string $company, int $ttlSeconds = 30
 
     $companyName = trim((string) $company);
 
-    if (auth_mimir_enabled()) {
+    if (auth_mimir_enabled() && !auth_mimir_circuit_is_open()) {
         $targetEnvironment = '';
         if ($companyName !== '') {
             try {
