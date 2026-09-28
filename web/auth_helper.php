@@ -59,14 +59,34 @@ function auth_mimir_circuit_is_open(): bool
 /**
  * Geeft de actieve environments terug op basis van config.
  */
+function auth_standalone_bc_ready(): bool
+{
+    auth_ensure_odata_loaded();
+    if (function_exists('odata_fallback_import_auth')) {
+        odata_fallback_import_auth();
+    }
+    if (!function_exists('odata_bc_base_url') || odata_bc_base_url() === null) {
+        return false;
+    }
+    if (!function_exists('odata_bc_auth_for_fallback') || !function_exists('odata_auth_is_usable')) {
+        return false;
+    }
+    return odata_auth_is_usable(odata_bc_auth_for_fallback([]));
+}
+
 function auth_get_active_environments(): array
 {
     global $auth_list, $environment;
+
+    if (function_exists('odata_fallback_import_auth')) {
+        odata_fallback_import_auth();
+    }
 
     $configured = [];
     if (isset($environment)) {
         $configured = auth_normalize_environment_list($environment);
     }
+    $unfiltered = $configured;
 
     $known = is_array($auth_list ?? null) ? array_keys($auth_list) : [];
     if ($configured !== []) {
@@ -74,6 +94,13 @@ function auth_get_active_environments(): array
         $configured = array_values(array_filter($configured, static function (string $item) use ($knownMap): bool {
             return isset($knownMap[$item]);
         }));
+    }
+
+    // $environment + standalone $auth blijven gelden zonder $auth_list,
+    // ook nadat het Mímir-circuit open is.
+    if ($configured === [] && $unfiltered !== [] && auth_standalone_bc_ready()
+        && (!auth_mimir_enabled() || auth_mimir_circuit_is_open())) {
+        return $unfiltered;
     }
 
     if ($configured === [] && $known !== []) {
@@ -118,6 +145,10 @@ function auth_get_auth_for_environment(string $environment): array
 {
     global $auth_list;
 
+    if (function_exists('odata_fallback_import_auth')) {
+        odata_fallback_import_auth();
+    }
+
     $environmentKey = trim($environment);
     $list = is_array($auth_list ?? null) ? $auth_list : [];
 
@@ -136,6 +167,14 @@ function auth_get_auth_for_environment(string $environment): array
         // Zodra Mímir is uitgevallen gelden weer de gewone BC-credentials.
         if ($mimirWithoutFallback) {
             return [];
+        }
+        if (function_exists('odata_bc_auth_for_fallback') && function_exists('odata_auth_is_usable')) {
+            $standalone = odata_bc_auth_for_fallback([]);
+            $allowed = isset($GLOBALS['environment']) ? auth_normalize_environment_list($GLOBALS['environment']) : [];
+            $envMatches = $allowed === [] || in_array($environmentKey, $allowed, true);
+            if ($envMatches && odata_auth_is_usable($standalone)) {
+                return $standalone;
+            }
         }
         throw new RuntimeException('Geen auth-configuratie gevonden voor environment: ' . $environmentKey);
     }

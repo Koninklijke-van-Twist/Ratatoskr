@@ -288,7 +288,12 @@ function ratatoskr_odata_get_all_uncached(string $url, array $auth): array
         if (function_exists('odata_bc_url_from_odata_url')) {
             $directUrl = odata_bc_url_from_odata_url($url);
         }
-        if (function_exists('odata_bc_auth_for_fallback')) {
+        if (function_exists('odata_fallback_auth_for_url')) {
+            $resolved = odata_fallback_auth_for_url($directUrl, $auth);
+            if (is_array($resolved)) {
+                $directAuth = $resolved;
+            }
+        } elseif (function_exists('odata_bc_auth_for_fallback')) {
             $resolved = odata_bc_auth_for_fallback($auth);
             if (is_array($resolved)) {
                 $directAuth = $resolved;
@@ -332,12 +337,23 @@ function ratatoskr_odata_get_all_with_cache_flag(string $url, array $auth, int $
     $mimirOwnsCache = function_exists('odata_mimir_enabled') && odata_mimir_enabled()
         && !(function_exists('odata_mimir_circuit_open') && odata_mimir_circuit_open());
     if ($mimirOwnsCache) {
-        // Mímir beheert de cache. from_cache blijft true zodat de debug-bol
-        // niet op elke order gaat branden; de lokale filecache wordt niet gelezen.
+        // Mímir beheert de cache zolang die call slaagt. Valt hij terug op BC,
+        // dan geldt of die directe fetch uit de lokale filecache kwam.
+        $directUrl = function_exists('odata_bc_url_from_odata_url') ? odata_bc_url_from_odata_url($url) : $url;
+        $directAuth = $auth;
+        if (function_exists('odata_fallback_auth_for_url')) {
+            $resolved = odata_fallback_auth_for_url($directUrl, $auth);
+            if (is_array($resolved)) {
+                $directAuth = $resolved;
+            }
+        }
+        $cachedBefore = ratatoskr_odata_is_valid_cache_entry($directUrl, $directAuth, max(1, $ttlSeconds));
+        $circuitBefore = function_exists('odata_mimir_circuit_open') && odata_mimir_circuit_open();
         $rows = odata_get_all($url, $auth, max(0, $ttlSeconds));
+        $fellBack = !$circuitBefore && function_exists('odata_mimir_circuit_open') && odata_mimir_circuit_open();
         return [
             'rows' => $rows,
-            'from_cache' => true,
+            'from_cache' => $fellBack ? $cachedBefore : true,
         ];
     }
 

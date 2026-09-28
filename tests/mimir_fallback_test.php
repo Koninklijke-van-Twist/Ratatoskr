@@ -223,4 +223,85 @@ if (!odata_mimir_circuit_open()) {
     fail('discovery-fallback moet het circuit openen');
 }
 
+odata_mimir_circuit_reset();
+$mimirApi = 'mimir_test_key_should_not_leak';
+$mimirBase = 'http://127.0.0.1:9';
+$baseUrl = 'https://bc.example:7148/';
+$environment = 'Production';
+$auth_list = [
+    'Production' => ['mode' => 'basic', 'user' => 'bcuser', 'pass' => 'bc-secret'],
+    'Sandbox' => ['mode' => 'basic', 'user' => 'sandbox-user', 'pass' => 'sandbox-secret'],
+];
+$auth = $auth_list['Production'];
+$GLOBALS['demeter_company_environment_map'] = ['KVT Gas' => 'Sandbox'];
+$beforeEnv = count($calls);
+$envRows = odata_mimir_query('KVT Gas', 'PurchaseOrders', ['$select' => 'No'], 30);
+$envCall = $calls[$beforeEnv] ?? null;
+if (($envRows[0]['No'] ?? '') !== 'WO-1' || !is_array($envCall) || strpos((string) $envCall['url'], '/Sandbox/ODataV4/') === false || $envCall['user'] !== 'sandbox-user') {
+    fail('query-fallback moet de company-map en bijbehorende auth_list gebruiken: ' . json_encode($envCall));
+}
+
+odata_mimir_circuit_reset();
+$beforeUrlEnv = count($calls);
+$urlEnvRows = odata_get_all(
+    "https://mimir.invalid/Sandbox/ODataV4/Company('KVT%20Gas')/PurchaseOrders?\$select=No",
+    $auth_list['Production'],
+    12
+);
+$urlEnvCall = $calls[$beforeUrlEnv] ?? null;
+if (($urlEnvRows[0]['No'] ?? '') !== 'WO-1' || !is_array($urlEnvCall) || strpos((string) $urlEnvCall['url'], "https://bc.example:7148/Sandbox/ODataV4/Company('KVT%20Gas')/PurchaseOrders?") !== 0 || $urlEnvCall['user'] !== 'sandbox-user') {
+    fail('URL-segment moet de environment kiezen, niet de globale: ' . json_encode($urlEnvCall));
+}
+
+odata_mimir_circuit_reset();
+$callsBeforeParse = count($calls);
+$parseThrew = false;
+try {
+    odata_mimir_fetch_all('https://example.test/not-odata', 10);
+} catch (Throwable $exception) {
+    $parseThrew = strpos($exception->getMessage(), 'kon niet worden vertaald') !== false;
+}
+if (!$parseThrew) {
+    fail('een onvertaalbare URL moet een fout geven');
+}
+if (odata_mimir_circuit_open()) {
+    fail('een parsefout mag het Mímir-circuit niet openen');
+}
+if (count($calls) !== $callsBeforeParse) {
+    fail('een parsefout mag niet naar BC vallen');
+}
+
+odata_mimir_circuit_reset();
+$auth_list = [];
+$environment = 'Production';
+$auth = ['mode' => 'basic', 'user' => 'solo', 'pass' => 'solo-secret'];
+$GLOBALS['demeter_company_environment_map'] = null;
+$GLOBALS['demeter_companies_by_environment'] = null;
+$GLOBALS['demeter_active_environments'] = null;
+$beforeSolo = count($calls);
+$solo = auth_discover_companies_across_active_environments(30);
+$soloCall = $calls[$beforeSolo] ?? null;
+if (($solo['map']['Hunter van Twist'] ?? '') !== 'Production' || !is_array($soloCall) || $soloCall['user'] !== 'solo') {
+    fail('standalone $auth moet environment en credentials behouden: ' . json_encode(['solo' => $solo, 'call' => $soloCall]));
+}
+
+odata_mimir_circuit_reset();
+$auth_list = [
+    'Production' => ['mode' => 'basic', 'user' => 'bcuser', 'pass' => 'bc-secret'],
+];
+$auth = $auth_list['Production'];
+$environment = 'Production';
+$cacheFlag = ratatoskr_odata_get_all_with_cache_flag(
+    "https://mimir.invalid/Production/ODataV4/Company('KVT%20Gas')/PurchaseOrders?\$select=No",
+    $auth,
+    60
+);
+if (($cacheFlag['from_cache'] ?? true) !== false || ($cacheFlag['rows'][0]['No'] ?? '') !== 'WO-1') {
+    fail('na fallback moet from_cache false zijn bij een cache-miss: ' . json_encode($cacheFlag));
+}
+$log = fallback_log();
+if (strpos($log, 'sandbox-secret') !== false || strpos($log, 'solo-secret') !== false || strpos($log, 'bc-secret') !== false) {
+    fail('log bevat een geheim na de extra fallbacks');
+}
+
 echo "OK\n";
