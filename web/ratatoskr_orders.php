@@ -55,9 +55,15 @@ function ratatoskr_company_entity_url_with_query(string $company, string $entity
         throw new RuntimeException('Geen environment beschikbaar.');
     }
 
+    $useMimirHost = function_exists('odata_mimir_enabled') && odata_mimir_enabled()
+        && !(function_exists('odata_mimir_circuit_open') && odata_mimir_circuit_open());
+
     $base = trim((string) ($baseUrl ?? ''));
-    // Lege $baseUrl is geldig in Mímir-modus; odata_get_all vertaalt het pad.
-    if ($base === '' && !(function_exists('odata_mimir_enabled') && odata_mimir_enabled())) {
+    if ($useMimirHost) {
+        // Synthetische host: odata_mimir_parse_entity_url leest het pad, de fallback
+        // herschrijft hem naar $baseUrl zodra Mímir in dit proces is uitgevallen.
+        $base = 'https://mimir.invalid';
+    } elseif ($base === '') {
         throw new RuntimeException('baseUrl ontbreekt in auth.php.');
     }
 
@@ -256,13 +262,8 @@ function ratatoskr_ttl_for_open_order_age(?int $ageDays): int
     return RATATOSKR_ORDER_TTL_NOT_RECEIVED;
 }
 
-function ratatoskr_odata_get_all_uncached(string $url, array $auth): array
+function ratatoskr_odata_fetch_pages_uncached(string $url, array $auth): array
 {
-    if (function_exists('odata_mimir_enabled') && odata_mimir_enabled() && function_exists('odata_mimir_fetch_all')) {
-        // Geen lokale filecache en geen BC-call. max_age 0 vraagt Mímir om verse data.
-        return odata_mimir_fetch_all($url, 0);
-    }
-
     $all = [];
     $next = $url;
 
@@ -277,6 +278,44 @@ function ratatoskr_odata_get_all_uncached(string $url, array $auth): array
     }
 
     return $all;
+}
+
+function ratatoskr_odata_get_all_uncached(string $url, array $auth): array
+{
+    $direct = static function () use ($url, $auth): array {
+        $directUrl = $url;
+        $directAuth = $auth;
+        if (function_exists('odata_bc_url_from_odata_url')) {
+            $directUrl = odata_bc_url_from_odata_url($url);
+        }
+        if (function_exists('odata_fallback_auth_for_url')) {
+            $resolved = odata_fallback_auth_for_url($directUrl, $auth);
+            if (is_array($resolved)) {
+                $directAuth = $resolved;
+            }
+        } elseif (function_exists('odata_bc_auth_for_fallback')) {
+            $resolved = odata_bc_auth_for_fallback($auth);
+            if (is_array($resolved)) {
+                $directAuth = $resolved;
+            }
+        }
+        return ratatoskr_odata_fetch_pages_uncached($directUrl, $directAuth);
+    };
+
+    if (function_exists('odata_mimir_enabled') && odata_mimir_enabled()
+        && function_exists('odata_mimir_or_direct')
+        && function_exists('odata_mimir_fetch_all_impl')) {
+        // Geen lokale filecache. max_age 0 vraagt Mímir om verse data;
+        // bij een fout geldt de pre-Mímir paginering via odata_get_json.
+        return odata_mimir_or_direct(
+            static function () use ($url): array {
+                return odata_mimir_fetch_all_impl($url, 0);
+            },
+            $direct
+        );
+    }
+
+    return $direct();
 }
 
 function ratatoskr_odata_is_valid_cache_entry(string $url, array $auth, int $ttlSeconds): bool
@@ -295,13 +334,26 @@ function ratatoskr_odata_is_valid_cache_entry(string $url, array $auth, int $ttl
 
 function ratatoskr_odata_get_all_with_cache_flag(string $url, array $auth, int $ttlSeconds): array
 {
-    if (function_exists('odata_mimir_enabled') && odata_mimir_enabled()) {
-        // Mímir beheert de cache. from_cache blijft true zodat de debug-bol
-        // niet op elke order gaat branden; de lokale filecache wordt niet gelezen.
+    $mimirOwnsCache = function_exists('odata_mimir_enabled') && odata_mimir_enabled()
+        && !(function_exists('odata_mimir_circuit_open') && odata_mimir_circuit_open());
+    if ($mimirOwnsCache) {
+        // Mímir beheert de cache zolang die call slaagt. Valt hij terug op BC,
+        // dan geldt of die directe fetch uit de lokale filecache kwam.
+        $directUrl = function_exists('odata_bc_url_from_odata_url') ? odata_bc_url_from_odata_url($url) : $url;
+        $directAuth = $auth;
+        if (function_exists('odata_fallback_auth_for_url')) {
+            $resolved = odata_fallback_auth_for_url($directUrl, $auth);
+            if (is_array($resolved)) {
+                $directAuth = $resolved;
+            }
+        }
+        $cachedBefore = ratatoskr_odata_is_valid_cache_entry($directUrl, $directAuth, max(1, $ttlSeconds));
+        $circuitBefore = function_exists('odata_mimir_circuit_open') && odata_mimir_circuit_open();
         $rows = odata_get_all($url, $auth, max(0, $ttlSeconds));
+        $fellBack = !$circuitBefore && function_exists('odata_mimir_circuit_open') && odata_mimir_circuit_open();
         return [
             'rows' => $rows,
-            'from_cache' => true,
+            'from_cache' => $fellBack ? $cachedBefore : true,
         ];
     }
 
