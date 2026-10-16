@@ -1,7 +1,11 @@
-# Beschermde server-only paden: exact de --exclude-glob-lijst van deploy-ftp.yml van vóór de security-PR (81deb676b3bcd639bcccbcb5a755cfe92513d08b).
+# Beschermde server-only paden: exact de --exclude-glob-lijst van deploy-ftp.yml.
 # Gebruikt door .github/deploy-guard.sh; de deploy faalt als lftp hier iets zou wissen of overschrijven.
 .htaccess
 cache/**
+cache/odata/**
+cache/odata/*/
+data/**
+uploads/**
 analytics/*.sqlite
 analytics/*.sqlite-*
 auth.php
