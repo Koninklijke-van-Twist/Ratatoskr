@@ -212,7 +212,6 @@ assert_contains($widget, 'odata.php?action=cache_status', 'widget houdt status-u
 foreach ([
     $root . '/web/cache/.htaccess',
     $root . '/web/cache/odata/.htaccess',
-    $root . '/web/data/.htaccess',
 ] as $htaccess) {
     $rules = (string) file_get_contents($htaccess);
     assert_contains($rules, 'Options -Indexes', $htaccess);
@@ -226,8 +225,6 @@ foreach ([
     $root . '/web/cache/index.php',
     $root . '/web/cache/odata/index.html',
     $root . '/web/cache/odata/index.php',
-    $root . '/web/data/index.html',
-    $root . '/web/data/index.php',
 ] as $indexFile) {
     if (!is_file($indexFile)) {
         fail('ontbrekend indexbestand ' . $indexFile);
@@ -239,36 +236,7 @@ foreach ([
     assert_not_contains($indexBody, 'Vendor', $indexFile);
 }
 
-$workflow = (string) file_get_contents($root . '/.github/workflows/deploy-ftp.yml');
-$includeAt = strpos($workflow, '--include-glob cache/.htaccess');
-$includeDataAt = strpos($workflow, '--include-glob data/.htaccess');
-$excludeHtaccessAt = strpos($workflow, '--exclude-glob .htaccess');
-$excludeCacheAt = strpos($workflow, '--exclude-glob cache/**');
-$excludeOdataAt = strpos($workflow, '--exclude-glob cache/odata/**');
-$excludeDataAt = strpos($workflow, '--exclude-glob data/**');
-if ($includeAt === false || $includeDataAt === false || $excludeCacheAt === false || $excludeOdataAt === false || $excludeDataAt === false) {
-    fail('ftp-deploy mist cache- of data-patronen');
-}
-if ($includeAt < $excludeCacheAt || $includeAt < $excludeOdataAt || $includeAt < $excludeHtaccessAt) {
-    fail('cache/.htaccess moet ná de cache-excludes staan, anders uploadt lftp hem niet');
-}
-if ($includeDataAt < $excludeDataAt || $includeDataAt < $excludeHtaccessAt) {
-    fail('data/.htaccess moet ná de excludes staan, anders uploadt lftp hem niet');
-}
-foreach ([
-    '--include-glob cache/index.html',
-    '--include-glob cache/index.php',
-    '--include-glob cache/odata/.htaccess',
-    '--include-glob cache/odata/index.html',
-    '--include-glob cache/odata/index.php',
-    '--include-glob data/',
-    '--include-glob data/index.html',
-    '--include-glob data/index.php',
-    '--exclude-glob auth.php',
-    '--exclude-glob .htaccess',
-] as $needle) {
-    assert_contains($workflow, $needle, 'ftp-deploy');
-}
+// FTP-deploy en afscherming: zie tests/protect_dirs_test.php.
 
 $runDirect = static function (string $phpBin, array $phpArgs, array $extraServer, string $label) use ($root, $orderNo, $vendorName): string {
     $script = sys_get_temp_dir() . '/ratatoskr-odata-' . bin2hex(random_bytes(4)) . '.php';
