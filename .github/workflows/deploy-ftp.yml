@@ -30,7 +30,9 @@ jobs:
           FTP_PASSWORD: ${{ secrets.FTP_PASSWORD }}
           FTP_REMOTE_DIR: ${{ secrets.FTP_REMOTE_DIR }}
 
-      # Stap 1: alles op de server opruimen behalve .htaccess, .htpasswd, *.json, auth.php
+      # Cache-JSON, de order-sqlite, locks en de root-.htaccess blijven op de server.
+      # lftp: het laatste passende patroon wint. Includes staan daarom
+      # ná de excludes, anders uploadt cache/.htaccess of data/.htaccess niet.
       - name: Deploy web/ to FTP (with delete & excludes)
         env:
           FTP_HOST: ${{ secrets.FTP_HOST }}
@@ -50,9 +52,24 @@ jobs:
           mirror -R --delete \
             --exclude-glob .htaccess \
             --exclude-glob cache/** \
+            --exclude-glob cache/odata/** \
+            --exclude-glob cache/odata/*/ \
+            --exclude-glob data/** \
             --exclude-glob analytics/*.sqlite \
             --exclude-glob analytics/*.sqlite-* \
             --exclude-glob auth.php \
+            --include-glob cache/ \
+            --include-glob cache/odata/ \
+            --include-glob cache/.htaccess \
+            --include-glob cache/index.html \
+            --include-glob cache/index.php \
+            --include-glob cache/odata/.htaccess \
+            --include-glob cache/odata/index.html \
+            --include-glob cache/odata/index.php \
+            --include-glob data/ \
+            --include-glob data/.htaccess \
+            --include-glob data/index.html \
+            --include-glob data/index.php \
             ./web .
 
           set cmd:fail-exit false
