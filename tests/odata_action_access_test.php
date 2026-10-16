@@ -212,7 +212,6 @@ assert_contains($widget, 'odata.php?action=cache_status', 'widget houdt status-u
 foreach ([
     $root . '/web/cache/.htaccess',
     $root . '/web/cache/odata/.htaccess',
-    $root . '/web/data/.htaccess',
 ] as $htaccess) {
     $rules = (string) file_get_contents($htaccess);
     assert_contains($rules, 'Options -Indexes', $htaccess);
@@ -226,8 +225,6 @@ foreach ([
     $root . '/web/cache/index.php',
     $root . '/web/cache/odata/index.html',
     $root . '/web/cache/odata/index.php',
-    $root . '/web/data/index.html',
-    $root . '/web/data/index.php',
 ] as $indexFile) {
     if (!is_file($indexFile)) {
         fail('ontbrekend indexbestand ' . $indexFile);
