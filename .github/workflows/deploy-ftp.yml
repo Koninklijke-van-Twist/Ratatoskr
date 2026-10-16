@@ -49,28 +49,33 @@ jobs:
 
           cd "$FTP_REMOTE_DIR"
 
+          # Server-only mappen (cache/, data/, uploads/) worden NIET gespiegeld, zodat --delete
+          # daar nooit iets wist. Alleen de afschermbestanden gaan mee via put (geen --delete).
           mirror -R --delete \
             --exclude-glob .htaccess \
-            --exclude-glob cache/** \
-            --exclude-glob cache/odata/** \
-            --exclude-glob cache/odata/*/ \
-            --exclude-glob data/** \
             --exclude-glob analytics/*.sqlite \
             --exclude-glob analytics/*.sqlite-* \
             --exclude-glob auth.php \
-            --include-glob cache/ \
-            --include-glob cache/odata/ \
-            --include-glob cache/.htaccess \
-            --include-glob cache/index.html \
-            --include-glob cache/index.php \
-            --include-glob cache/odata/.htaccess \
-            --include-glob cache/odata/index.html \
-            --include-glob cache/odata/index.php \
-            --include-glob data/ \
-            --include-glob data/.htaccess \
-            --include-glob data/index.html \
-            --include-glob data/index.php \
+            --exclude-glob cache/ \
+            --exclude-glob cache/** \
+            --exclude-glob data/ \
+            --exclude-glob data/** \
+            --exclude-glob uploads/ \
+            --exclude-glob uploads/** \
             ./web .
+
+          mkdir -p -f cache
+          mkdir -p -f cache/odata
+          mkdir -p -f data
+          put -O cache web/cache/.htaccess
+          put -O cache web/cache/index.html
+          put -O cache web/cache/index.php
+          put -O cache/odata web/cache/odata/.htaccess
+          put -O cache/odata web/cache/odata/index.html
+          put -O cache/odata web/cache/odata/index.php
+          put -O data web/data/.htaccess
+          put -O data web/data/index.html
+          put -O data web/data/index.php
 
           set cmd:fail-exit false
           chmod 777 analytics
