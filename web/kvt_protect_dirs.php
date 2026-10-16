@@ -9,12 +9,6 @@
 if (!function_exists('kvt_ensure_protected_dirs')) {
     function kvt_ensure_protected_dirs(?string $webRoot = null): void
     {
-        static $done = false;
-        if ($done) {
-            return;
-        }
-        $done = true;
-
         $webRoot = $webRoot ?? __DIR__;
         $files = [
             '.htaccess' => "Options -Indexes\n"
@@ -45,4 +39,10 @@ if (!function_exists('kvt_ensure_protected_dirs')) {
     }
 }
 
-kvt_ensure_protected_dirs();
+// Bij het laden én aan het eind van het request: mappen die tijdens dit request
+// ontstaan (cache/odata, data/..., uploads/...) krijgen zo meteen hun afscherming.
+if (!defined('KVT_PROTECT_DIRS_REGISTERED')) {
+    define('KVT_PROTECT_DIRS_REGISTERED', true);
+    kvt_ensure_protected_dirs();
+    register_shutdown_function('kvt_ensure_protected_dirs');
+}

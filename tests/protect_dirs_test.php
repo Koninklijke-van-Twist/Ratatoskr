@@ -10,7 +10,7 @@ file_put_contents($tmp . '/data/index.html', 'bestaand');
 require $root . '/web/kvt_protect_dirs.php';
 // De automatische aanroep draaide op web/; nu expliciet op de testmap (static guard omzeilen via subproces).
 $helper = file_get_contents($root . '/web/kvt_protect_dirs.php');
-$helper = str_replace('kvt_ensure_protected_dirs();', 'kvt_ensure_protected_dirs(' . var_export($tmp, true) . ');', $helper);
+$helper = str_replace("register_shutdown_function('kvt_ensure_protected_dirs');", '', str_replace('    kvt_ensure_protected_dirs();', '    kvt_ensure_protected_dirs(' . var_export($tmp, true) . ');', $helper));
 $script = $tmp . '/run.php';
 file_put_contents($script, $helper);
 shell_exec(escapeshellarg(PHP_BINARY) . ' ' . escapeshellarg($script));
